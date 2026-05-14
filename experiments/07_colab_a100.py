@@ -207,12 +207,19 @@ class CausalFluidLM(nn.Module):
     def num_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor,
+                 use_checkpoint: bool = False) -> torch.Tensor:
         B, L = input_ids.shape
         pos  = torch.arange(L, device=input_ids.device).unsqueeze(0)
         u    = self.emb_drop(self.token_emb(input_ids) + self.pos_emb(pos))
         for layer in self.layers:
-            u = layer(u)
+            if use_checkpoint and self.training:
+                # Gradient checkpointing: aktivasyonlari saklamaz,
+                # backward sirasinda yeniden hesaplar. Bellek ~1/n_layers azalir.
+                u = torch.utils.checkpoint.checkpoint(
+                    layer, u, use_reentrant=False)
+            else:
+                u = layer(u)
         return self.lm_head(self.norm(u))   # [B, L, vocab_size]
 
     def physical_params(self):
@@ -272,28 +279,37 @@ def decode(ids):
 
 # ── Hiperparametreler ─────────────────────────────────────────────────────────
 
-# A100 (40GB):  d=1024, L=16, seq=512  -> ~100M param, ~6GB VRAM (bf16)
-# A100 (80GB):  d=1536, L=20, seq=512  -> ~280M param
-# T4   (16GB):  d=512,  L=12, seq=256  -> ~25M param
+# Bellek tahmini (bf16, gradient checkpointing ACIK):
+#   Aktivasyon/batch = B * seq * d * 2 bytes * sabit (~4 tensor/katman)
+#   d=1024, seq=512, B=32: 32*512*1024*2*4 = 134 MB  (cok uygun)
+#   Parametreler: ~100M * 2 bytes = 200 MB
+#   Optimizer (AdamW): 2x param = 400 MB
+#   Toplam ~A100 80GB'nin ~1 GB'si
+#
+# A100 80GB: batch=32, GRAD_ACCUM=8  -> effective_batch = 256
+# A100 40GB: batch=16, GRAD_ACCUM=8  -> effective_batch = 128
+# T4   16GB: batch=8,  GRAD_ACCUM=8  -> effective_batch = 64
 
 D_MODEL    = 1024
 N_LAYERS   = 16
 SEQ_LEN    = 512
 MLP_RATIO  = 4
 DROPOUT    = 0.1
+USE_CKPT   = True   # gradient checkpointing — bellek ~%60 azalir
 
-# VRAM'a gore otomatik batch boyutu
 if DEVICE.type == "cuda":
     vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    if vram_gb >= 70:   BATCH_SIZE = 256   # A100 80GB
-    elif vram_gb >= 35: BATCH_SIZE = 128   # A100 40GB
-    elif vram_gb >= 14: BATCH_SIZE = 32    # T4 16GB
-    else:               BATCH_SIZE = 16    # diger
+    if vram_gb >= 70:   BATCH_SIZE, GRAD_ACCUM = 32, 8   # A100 80GB
+    elif vram_gb >= 35: BATCH_SIZE, GRAD_ACCUM = 16, 8   # A100 40GB
+    elif vram_gb >= 14: BATCH_SIZE, GRAD_ACCUM = 8,  8   # T4 16GB
+    else:               BATCH_SIZE, GRAD_ACCUM = 4,  4
 else:
-    BATCH_SIZE = 4
+    BATCH_SIZE, GRAD_ACCUM = 4, 2
+
+EFFECTIVE_BATCH = BATCH_SIZE * GRAD_ACCUM
 
 EPOCHS    = 200
-LR        = 3e-4     # AdamW ile buyuk model icin guvenli
+LR        = 3e-4
 CLIP_NORM = 1.0
 PATIENCE  = 25
 WARMUP_EP = 10
@@ -340,9 +356,11 @@ if USE_BF16:
 
 n_params = model.num_parameters()
 print(f"\nModel   : d={D_MODEL}, L={N_LAYERS}, seq={SEQ_LEN}, "
-      f"mlp_ratio={MLP_RATIO}, batch={BATCH_SIZE}")
+      f"mlp_ratio={MLP_RATIO}")
 print(f"Param   : {n_params:,}  ({n_params/1e6:.1f}M)")
 print(f"Dtype   : {DTYPE}")
+print(f"Batch   : {BATCH_SIZE} x {GRAD_ACCUM} accum = {EFFECTIVE_BATCH} effective")
+print(f"Grad ckpt: {USE_CKPT}  (bellek tasarrufu: ~%60)")
 
 # ── Optimizer & scheduler (warmup + cosine) ───────────────────────────────────
 
@@ -365,7 +383,7 @@ scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda" and not USE_BF
 train_losses, val_losses, val_ppls = [], [], []
 
 print(f"\nEgitim: {EPOCHS} epoch, LR={LR}, patience={PATIENCE}, "
-      f"warmup={WARMUP_EP}")
+      f"warmup={WARMUP_EP}, eff_batch={EFFECTIVE_BATCH}")
 print("-" * 70)
 
 best_val   = float("inf")
@@ -377,20 +395,27 @@ for epoch in range(1, EPOCHS + 1):
     model.train()
     train_batches = make_batches(train_ids, SEQ_LEN, BATCH_SIZE, shuffle=True)
     epoch_loss = 0.0
+    optimizer.zero_grad()
 
-    for x, y in train_batches:
-        optimizer.zero_grad()
-        with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda"),
-                                     dtype=DTYPE):
-            logits = model(x)
+    for step, (x, y) in enumerate(train_batches):
+        is_last = (step == len(train_batches) - 1)
+        accum_step = (step + 1) % GRAD_ACCUM == 0 or is_last
+
+        with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
+            logits = model(x, use_checkpoint=USE_CKPT)
             loss   = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE),
                                      y.reshape(-1), ignore_index=PAD_ID)
+            loss   = loss / GRAD_ACCUM  # normalize
+
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
-        scaler.step(optimizer)
-        scaler.update()
-        epoch_loss += loss.item()
+        epoch_loss += loss.item() * GRAD_ACCUM  # un-normalize for logging
+
+        if accum_step:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), CLIP_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
 
     scheduler.step()
     avg_train = epoch_loss / max(len(train_batches), 1)
@@ -403,7 +428,7 @@ for epoch in range(1, EPOCHS + 1):
     with torch.no_grad(), torch.cuda.amp.autocast(
             enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
         for x, y in val_batches:
-            logits = model(x)
+            logits = model(x, use_checkpoint=False)
             v_loss += F.cross_entropy(logits.reshape(-1, VOCAB_SIZE),
                                       y.reshape(-1), ignore_index=PAD_ID).item()
     avg_val = v_loss / max(len(val_batches), 1)
@@ -472,7 +497,7 @@ def generate(prompt_text: str, max_new: int = 400,
     ids = ids[:, -(SEQ_LEN + 4):]
     for _ in range(max_new):
         with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
-            logits = model(ids)
+            logits = model(ids, use_checkpoint=False)
         next_l = logits[0, -1, :].float() / max(temperature, 1e-6)
         if top_k > 0:
             topk_v, _ = torch.topk(next_l, min(top_k, next_l.size(-1)))
