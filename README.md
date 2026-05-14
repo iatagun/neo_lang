@@ -64,6 +64,7 @@ neo_lang/
 │   ├── 10_fluidlm_faircompare.py   # ★★ Routing izolasyonu — 48 param vs 28M MHA
 │   ├── 11_flop_and_physics.py      # FLOP analizi + öğrenilen fizik parametreleri
 │   ├── 12_ablation_alpha_pscale.py # Ablasyon: α/p_scale dondurulunca ne olur?
+│   ├── 14_industrial_compare.py   # ★★★ BPE + OpenWebText, S/M scale, multi-seed
 │   ├── compare_results.py          # Checkpoint okuyucu, karşılaştırma tablosu
 │   └── _param_breakdown.py         # Parametre dökümü (NS=64, MLP=99.5%)
 │
@@ -193,6 +194,21 @@ python experiments/13_visualize_3d.py
 
 # 13 — 3D görselleştirme (eğitilmiş checkpoint ile)
 python experiments/13_visualize_3d.py --ckpt experiments/10_fluidlm_fair_best.pt
+
+# 14 — Industrial: BPE + OpenWebText, S scale, 3 seed, 3B token
+python experiments/14_industrial_compare.py --scale S --tokens 3e9
+
+# 14 — Industrial: hem S hem M, tek seed, 1B token (hızlı pilot)
+python experiments/14_industrial_compare.py --scale both --tokens 1e9 --seeds 42
+
+# 14 — Industrial: M scale, 10B token (publication-ready)
+python experiments/14_industrial_compare.py --scale M --tokens 10e9 --seeds 42
+
+# 14 — WikiText-103 zero-shot eval (checkpoint hazır ise)
+python experiments/14_industrial_compare.py --eval_only \
+    --fluid_ckpt results/14_fluid_S_s42_best.pt \
+    --gpt_ckpt   results/14_gpt_S_s42_best.pt \
+    --wikitext_eval
 
 # Tüm checkpoint'leri oku, karşılaştırma tablosu yaz
 python experiments/compare_results.py
@@ -421,9 +437,56 @@ Eğer |ΔPPL| < 0.05 → “Helmholtz regularizasyonu için tek global değer ye
 
 ---
 
+### Deney 14 — Industrial Scale: BPE + OpenWebText
 
+> **Durum:** Planlandı — Colab A100 veya daha büyük GPU gerektirir.
 
-### Causal Navier-Stokes Operatörler
+Char-level Shakespeare'den gerçek NLP ölçeğine geçiş:
+
+| Özellik | Exp 10 (fair compare) | Exp 14 (industrial) |
+|---------|----------------------|---------------------|
+| Tokenizer | 65-vocab char | GPT-2 BPE, 50,257 vocab |
+| Corpus | Tiny Shakespeare 1MB | OpenWebText ~38GB |
+| Eğitim birimi | Epoch | **Token budget** (Chinchilla) |
+| PPL türü | Char-PPL | **Token-PPL** — yayın standardı |
+| Karşılaştırma | Tek run | Multi-seed (42/43/44) → mean±σ |
+| Benchmark | — | WikiText-103 zero-shot PPL |
+| Ölçek | S (57M / 85M) | S ve M (GPT-2 small/medium eşdeğeri) |
+
+**Model çiftleri (izole routing karşılaştırması — aynı MLP):**
+
+| Model | d | L | Routing | MLP | Toplam | Routing% |
+|-------|---|---|---------|-----|--------|---------|
+| FluidLM-S | 768 | 12 | **48 param** | 56M | ~95M | 0.00005% |
+| GPT-S | 768 | 12 | 28.3M (MHA) | 56M | ~123M | 23.0% |
+| FluidLM-M | 1024 | 24 | **96 param** | 201M | ~285M | 0.00003% |
+| GPT-M | 1024 | 24 | 100.7M (MHA) | 201M | ~354M | 28.5% |
+
+**Araştırma soruları:**
+- **RQ1:** NS routing, BPE token-PPL'de MHA ile kıyaslanabilir mi?
+- **RQ2:** FLOP/token avantajı (teorik O(T log T) vs O(T²)) pratikte ölçülebiliyor mu?
+- **RQ3:** Char-level'da bulunan ν gradyanı (0.011→0.016), BPE+OpenWebText'te de tekrarlıyor mu?
+
+```bash
+# Pip kurulum (Colab)
+pip install tiktoken datasets
+
+# Pilot: S scale, 1B token, tek seed (~2 saat A100)
+python experiments/14_industrial_compare.py --scale S --tokens 1e9 --seeds 42
+
+# Full: S scale, 3B token, 3 seed + WikiText-103 eval (~8 saat A100)
+python experiments/14_industrial_compare.py --scale S --tokens 3e9 --wikitext_eval
+
+# Multi-GPU (DDP, 4×A100)
+torchrun --nproc_per_node=4 experiments/14_industrial_compare.py --scale M --tokens 10e9
+```
+
+**Çıktılar:**
+- `results/14_industrial_compare.json` — tüm metrikler (seed başına + ortalama±σ)
+- `results/14_industrial_compare.png` — 5 panel: eğitim eğrileri, PPL bar, FLOP dağılımı, routing param log, ν gradyanı
+- `results/14_industrial_summary.md` — paper §5 taslağı (tablo + RQ yorumları)
+
+---
 
 Standart NS'te basınç tüm diziyi aynı anda görür (global). Dil modeli için **nedensellik** (causality) zorunlu — model gelecek tokenlara bakamaz. Bunu sağlamak için tüm operatörler **geriye fark** (backward difference) ile yeniden tanımlandı:
 
@@ -488,6 +551,7 @@ Bulgular üç bağımsız katkıya ayrılıyor, her biri kendi başına yayınla
 | **§4.3 Emergent Fiziksel Yapı** | Model ν gradyanını söylenmeden keşfetti (erken→geç: 0.011→0.016) | Deney fizik (11_physics) |
 | **§4.4 Ablasyon** | α/p_scale'in sabit tutulması PPL'i değiştirmiyor | Deney ablasyon (12_ablation) |
 | **§5 Ölçekleme** | PPL farkı büyük modelde de ~0.3 civarında kalıyor | 08 (950M, beklemede) |
+| **§5.2 Industrial** | BPE + OpenWebText'te ν gradyanı tekrarlanıyor, FLOP avantajı korunuyor | **14_industrial_compare** |
 
 **Hedef dergi/konferans:** 08 sonuçları ölçeklenmeyi doğrularsa → ICLR 2027. Doğrulamazsa → ACL/EMNLP küçük model katkısı olarak.
 
