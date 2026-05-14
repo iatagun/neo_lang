@@ -87,8 +87,12 @@ def causal_pressure(adv: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     - Unlike FFT Poisson, this is strictly causal.
     """
     div = causal_divergence(adv)                               # [B, L]
-    p   = torch.cumsum(-div, dim=1) / (alpha + 1e-6)          # [B, L]
-    p   = p / (p.std(dim=1, keepdim=True) + 1e-6)             # normalise
+    p   = torch.cumsum(-div, dim=1)                            # [B, L]
+    # alpha: basincin ne kadar etkiledigini olcekler — normalise etmeden once
+    # (normalise sonra yapilirsa alpha'nin gradyani sifirlanir)
+    p   = p * alpha
+    # Hafif normalise: sadece patlamaya karsi, gradyani oldurmesin
+    p   = p / (p.detach().std(dim=1, keepdim=True).clamp(min=0.5) + 1e-6)
     return p
 
 # ── Causal FluidLayer  (NS adimi + MLP sublayer) ──────────────────────────────
@@ -298,7 +302,7 @@ D_MODEL    = 1024
 N_LAYERS   = 16
 SEQ_LEN    = 512
 MLP_RATIO  = 4
-DROPOUT    = 0.1
+DROPOUT    = 0.2   # 0.1 → 0.2: epoch 29'da overfitting basliyor, daha fazla regularize
 USE_CKPT   = True   # gradient checkpointing — bellek ~%60 azalir
 
 if DEVICE.type == "cuda":
@@ -367,9 +371,27 @@ print(f"Batch   : {BATCH_SIZE} x {GRAD_ACCUM} accum = {EFFECTIVE_BATCH} effectiv
 print(f"Grad ckpt: {USE_CKPT}  (bellek tasarrufu: ~%60)")
 
 # ── Optimizer & scheduler (warmup + cosine) ───────────────────────────────────
+# Fiziksel parametreler (nu, dt, alpha, p_scale) icin 10x buyuk LR:
+# Bu parametreler cok az sayida skaler oldugu icin MLP agirliklarinin
+# golgesinde kaliyor; daha buyuk LR ile signal alabilsinler.
+phys_ids = set()
+for layer in model.layers:
+    for name in ['log_nu', 'log_dt', 'log_alpha', 'log_p_scale']:
+        phys_ids.add(id(getattr(layer, name)))
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR,
-                               weight_decay=1e-2, betas=(0.9, 0.95))
+phys_params = [p for p in model.parameters() if id(p) in phys_ids]
+rest_params  = [p for p in model.parameters() if id(p) not in phys_ids]
+
+optimizer = torch.optim.AdamW(
+    [
+        {"params": rest_params,  "lr": LR,      "weight_decay": 1e-2},
+        {"params": phys_params,  "lr": LR * 10, "weight_decay": 0.0},
+    ],
+    betas=(0.9, 0.95)
+)
+
+print(f"Optimizer: {len(rest_params)} genel param grubu, "
+      f"{len(phys_params)} fizik param grubu (LR x10)")
 
 def lr_lambda(ep):
     if ep < WARMUP_EP:
@@ -380,7 +402,7 @@ def lr_lambda(ep):
 scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 # AMP (Automatic Mixed Precision) — A100'de bf16 kullan
-scaler = torch.cuda.amp.GradScaler(enabled=(DEVICE.type == "cuda" and not USE_BF16))
+scaler = torch.amp.GradScaler('cuda', enabled=(DEVICE.type == "cuda" and not USE_BF16))
 
 # ── Egitim dongusu ────────────────────────────────────────────────────────────
 
