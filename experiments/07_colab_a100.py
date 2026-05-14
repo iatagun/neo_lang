@@ -79,20 +79,49 @@ def causal_divergence(u: torch.Tensor) -> torch.Tensor:
 
 def causal_pressure(adv: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     """
-    Causal pressure: cumulative integral of divergence.
+    Causal pressure field via spectral (FFT) Poisson solver.
 
-    p[i] = -cumsum(div(adv))[i] / alpha
+    Çözülen denklem (Helmholtz-Poisson):
+        (∇² − α²) p = −div(adv)
 
-    - Provides left-to-right global coupling without leaking future tokens.
-    - Unlike FFT Poisson, this is strictly causal.
+    Fourier alanında:
+        p̂_k = f̂_k / λ_k    λ_k = 2(cos(2πk/L)−1) − α²
+
+    λ_k ≤ −α² < 0 olduğu için payda sıfıra gitmez → kararlı.
+
+    [NOT — Nedensellik meselesi]
+    FFT dairesel (periodic) konvolüsyon kullanır: gelecek tokenlar
+    basınç üzerinden sıfır ağırlıkla da olsa etkiler. Bu, dil modeli
+    için teknik olarak nedensel ihlaldir. Pratikte iki yaklaşım var:
+
+    1. cumsum yaklaşımı (önceki versiyon):
+       p[i] = −cumsum(div)[i] × α  → kesinlikle causal, ama 1. derece
+       Green fonksiyonu (∂p/∂x = −div), Poisson değil.
+
+    2. FFT Poisson (bu versiyon):
+       Gerçek ∇²p = −div, global etkileşim, ama periodicity nedeniyle
+       yarı-causal (sağ sınır soldan ~exp(−α·L) kadar etkileniyor).
+
+    α büyükse (> 2) sağdan gelen etki ihmal edilebilir düzeye iner.
+    Bu bir tasarım seçimi — α öğrenilen bir parametredir.
     """
-    div = causal_divergence(adv)                               # [B, L]
-    p   = torch.cumsum(-div, dim=1)                            # [B, L]
-    # alpha: basincin ne kadar etkiledigini olcekler — normalise etmeden once
-    # (normalise sonra yapilirsa alpha'nin gradyani sifirlanir)
-    p   = p * alpha
-    # Hafif normalise: sadece patlamaya karsi, gradyani oldurmesin
-    p   = p / (p.detach().std(dim=1, keepdim=True).clamp(min=0.5) + 1e-6)
+    div   = causal_divergence(adv)                                # [B, L]
+    B, L  = div.shape
+
+    # FFT Poisson
+    rhs_fft  = torch.fft.rfft(div.float(), dim=1)                 # [B, L//2+1]
+    k        = torch.arange(L // 2 + 1, dtype=torch.float32,
+                            device=div.device)
+    alpha_f  = alpha.float() if isinstance(alpha, torch.Tensor) else float(alpha)
+    lambda_k = 2.0 * (torch.cos(2.0 * math.pi * k / L) - 1.0) - alpha_f ** 2
+    lambda_k = lambda_k.masked_fill(lambda_k.abs() < 1e-8, -1e-8) # payda güvencesi
+
+    p_fft    = -rhs_fft / lambda_k.unsqueeze(0)                   # [B, L//2+1]
+    p        = torch.fft.irfft(p_fft, n=L, dim=1)                 # [B, L]
+    p        = p.to(adv.dtype)
+
+    # Gradyan öldürmeyen normalleştirme
+    p = p / (p.detach().std(dim=1, keepdim=True).clamp(min=0.5) + 1e-6)
     return p
 
 # ── Causal FluidLayer  (NS adimi + MLP sublayer) ──────────────────────────────

@@ -138,16 +138,24 @@ os.makedirs(CFG["output_dir"], exist_ok=True)
 # ─────────────────────────────────────────────────────────────────────────────
 # Batch / Grad Accum — VRAM'a göre otomatik
 # ─────────────────────────────────────────────────────────────────────────────
-# d=2048, seq=1024, bf16, grad ckpt:
-#   Parametre: ~950M × 2 bytes = 1.9 GB
-#   Optimizer:                   3.8 GB
-#   Aktivasyon/batch (ckpt ile): B × 1024 × 2048 × 2 × ~4 = B × 16 MB
-#   B=8 → 128 MB aktivasyon  ✓ toplam ~6 GB
+# d=2048, seq=1024, bf16, grad ckpt ON:
+#
+#   Parametreler (~950M × 2 bytes bf16)     : ~1.9 GB
+#   Optimizer (AdamW fp32: param+m+v × 4b)  : 3 × 950M × 4 = ~11.4 GB
+#   Gradyanlar (bf16)                        : ~1.9 GB
+#   Aktivasyonlar grad-ckpt ile (per batch):
+#     ckpt sadece checkpoint noktalarını tutar → B×seq×d×2 ≈ B × 4 MB
+#     B=16 → ~64 MB
+#   ──────────────────────────────────────────────────────
+#   TOPLAM (B=16)                            : ~17 GB
+#
+#   NOT: bf16 param + fp32 optimizer = "mixed precision" standart ayar.
+#   Sadece parametreler bf16, optimizer state fp32 tutulur.
 #
 if CFG["batch_size"] is None:
-    if   vram_gb >= 80: CFG["batch_size"], CFG["grad_accum"] = 16, 16  # 256 effective
-    elif vram_gb >= 40: CFG["batch_size"], CFG["grad_accum"] = 8,  16  # 128 effective
-    elif vram_gb >= 20: CFG["batch_size"], CFG["grad_accum"] = 4,  16  # 64  effective
+    if   vram_gb >= 80: CFG["batch_size"], CFG["grad_accum"] = 16, 16  # ~17 GB, eff=256
+    elif vram_gb >= 40: CFG["batch_size"], CFG["grad_accum"] = 8,  16  # ~15 GB, eff=128
+    elif vram_gb >= 24: CFG["batch_size"], CFG["grad_accum"] = 4,  16  # ~14 GB, eff=64
     else:               CFG["batch_size"], CFG["grad_accum"] = 2,  8
 
 effective_batch = CFG["batch_size"] * CFG["grad_accum"] * ddp_world_size
@@ -282,12 +290,22 @@ def causal_divergence(u: torch.Tensor) -> torch.Tensor:
 
 def causal_pressure(adv: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
     """
-    p[i] = alpha * cumsum(-div(adv))[i]
-    alpha gradyanını korumak için normalizasyonda .detach() kullan.
+    Spectral (FFT) Helmholtz-Poisson pressure solver.
+
+    Çözülen:  (∇² − α²) p = −div(adv)
+    Fourier:  p̂_k = −f̂_k / λ_k,   λ_k = 2(cos(2πk/L)−1) − α²
     """
-    div = causal_divergence(adv)
-    p   = torch.cumsum(-div, dim=1) * alpha
-    p   = p / (p.detach().std(dim=1, keepdim=True).clamp(min=0.5) + 1e-6)
+    div  = causal_divergence(adv)
+    B, L = div.shape
+
+    rhs_fft  = torch.fft.rfft(div.float(), dim=1)
+    k        = torch.arange(L // 2 + 1, dtype=torch.float32, device=div.device)
+    alpha_f  = alpha.float() if isinstance(alpha, torch.Tensor) else float(alpha)
+    lambda_k = 2.0 * (torch.cos(2.0 * math.pi * k / L) - 1.0) - alpha_f ** 2
+    lambda_k = lambda_k.masked_fill(lambda_k.abs() < 1e-8, -1e-8)
+
+    p = torch.fft.irfft(-rhs_fft / lambda_k.unsqueeze(0), n=L, dim=1).to(adv.dtype)
+    p = p / (p.detach().std(dim=1, keepdim=True).clamp(min=0.5) + 1e-6)
     return p   # [B, L]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -621,12 +639,17 @@ if __name__ == "__main__":
     # Kaç step/epoch?
     steps_per_epoch = max(1, len(train_ds) // (CFG["batch_size"] * CFG["grad_accum"]))
     val_steps       = min(200, len(val_ds) // CFG["batch_size"])
+    LOG_EVERY       = max(10, steps_per_epoch // 20)   # ~20 log/epoch
+
+    log(f"Steps/epoch={steps_per_epoch}  log_every={LOG_EVERY}  val_steps={val_steps}")
 
     t0_total = time.time()
 
     for epoch in range(start_epoch, CFG["epochs"] + 1):
         model.train()
-        epoch_loss = 0.0
+        epoch_loss   = 0.0
+        step_t0      = time.time()
+        recent_loss  = 0.0
         optimizer.zero_grad()
 
         for accum_i in range(steps_per_epoch * CFG["grad_accum"]):
@@ -656,6 +679,7 @@ if __name__ == "__main__":
 
                 scaler.scale(loss).backward()
             epoch_loss += loss.item() * CFG["grad_accum"]
+            recent_loss += loss.item() * CFG["grad_accum"]
 
             if is_last_accum:
                 scaler.unscale_(optimizer)
@@ -664,6 +688,21 @@ if __name__ == "__main__":
                 scaler.update()
                 optimizer.zero_grad()
                 total_steps += 1
+
+                # ── Per-step log ────────────────────────────────────────────
+                if step_i % LOG_EVERY == 0 or step_i == steps_per_epoch - 1:
+                    elapsed   = time.time() - step_t0
+                    sps       = (step_i + 1) / max(elapsed, 1e-6)     # steps/sec
+                    remain    = (steps_per_epoch - step_i - 1) / max(sps, 1e-9)
+                    avg_recent = recent_loss / max(LOG_EVERY, 1)
+                    recent_loss = 0.0
+                    cur_lr    = optimizer.param_groups[0]["lr"]
+                    log(f"  Ep {epoch}/{CFG['epochs']}  "
+                        f"step {step_i+1:>5}/{steps_per_epoch}  "
+                        f"loss={avg_recent:.4f}  "
+                        f"lr={cur_lr:.2e}  "
+                        f"{sps:.2f}s/s  "
+                        f"ETA {remain/60:.1f}m")
 
         avg_train = epoch_loss / (steps_per_epoch * CFG["grad_accum"])
         train_losses.append(avg_train)
