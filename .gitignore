@@ -1,0 +1,57 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Model checkpoints & weights ───────────────────────────────────────────────
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+
+# ── Training outputs & logs ───────────────────────────────────────────────────
+results/
+outputs/
+runs/
+wandb/
+*.log
+*.csv
+*.json
+!configs/*.json
+
+# ── Data (büyük dosyalar) ──────────────────────────────────────────────────────
+data/
+*.txt
+!README.md
+
+# ── Jupyter ────────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── IDE & araçlar ─────────────────────────────────────────────────────────────
+.qodo/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── HuggingFace cache ─────────────────────────────────────────────────────────
+.cache/
+~/.cache/huggingface/

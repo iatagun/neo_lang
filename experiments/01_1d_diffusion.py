@@ -29,7 +29,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")          # headless — saves PNG instead of showing window
 import matplotlib.pyplot as plt
-from src.fluid_ops import laplacian
+from fluidlm.fluid_ops import laplacian
 import torch
 
 # ─── Parametreler ──────────────────────────────────────────────────────────

@@ -29,8 +29,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from src.fluid_ops import gradient, laplacian, divergence, solve_poisson
-from src.ns_layer import FluidLayer
+from fluidlm.fluid_ops import gradient, laplacian, divergence, solve_poisson
+from fluidlm.ns_layer import FluidLayer
 
 torch.manual_seed(42)
 

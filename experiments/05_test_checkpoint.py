@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-from src.fluid_lm import FluidLM
+from fluidlm.fluid_lm import FluidLM
 
 # ── Argümanlar ────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()

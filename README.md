@@ -36,19 +36,98 @@ Basınç alanı `p`, **tüm token dizisinden** aynı anda etkileniyor (Poisson d
 
 ```
 neo_lang/
-├── src/
-│   ├── fluid_ops.py     # ∇, ∇², div, Poisson çözücü (FFT tabanlı)
-│   ├── ns_layer.py      # Navier-Stokes katmanı (Euler / RK4)
-│   ├── fluid_lm.py      # Tam dil modeli + adaptif derinlik + üretim
-│   └── __init__.py
-├── experiments/
-│   ├── 01_1d_diffusion.py    # 1D difüzyon — temel kavramlar
-│   ├── 02_ns_layer_test.py   # NS katmanı analizi — basınç/attention karşılaştırması
-│   └── 03_toy_lm_train.py    # Karakter düzeyi eğitim
+├── fluidlm/                        # Çekirdek kütüphane (pip install -e . ile kullanılabilir)
+│   ├── __init__.py
+│   ├── fluid_ops.py                # ∇, ∇², div, Poisson çözücü (causal, FFT tabanlı)
+│   ├── ns_layer.py                 # Navier-Stokes katmanı (causal=True default)
+│   └── fluid_lm.py                 # Tam dil modeli + adaptif derinlik + üretim
+│
+├── experiments/                    # Çalıştırılabilir scriptler (koda dokunmaz)
+│   ├── 01_1d_diffusion.py          # 1D difüzyon — temel kavramlar
+│   ├── 02_ns_layer_test.py         # NS katmanı analizi
+│   ├── 03_toy_lm_train.py          # İlk karakter düzeyi eğitim
+│   ├── 04_full_train_and_generate.py
+│   ├── 05_shakespeare_full.py      # d=256, L=6 — erken durdurma
+│   ├── 05_test_checkpoint.py
+│   ├── 06_shakespeare_large.py
+│   ├── 07_colab_a100.py            # ★  135M param, char-level — Blackwell
+│   ├── 07_eval_memorization.py     # Ezberleme vs genelleme (5 test)
+│   └── 08_industry_scale.py        # ★★ ~950M param, BPE, FineWeb-Edu
+│
+├── checkpoints/                    # Kaydedilen ağırlıklar — git'e dahil değil
+│   └── 07_best_model.pt
+│
+├── results/                        # Grafikler, loglar — git'e dahil değil
+│   └── *.png
+│
 ├── configs/
 │   └── base_config.yaml
-└── requirements.txt
+├── data/                           # Ham veri — git'e dahil değil
+├── .gitignore
+├── requirements.txt
+└── LICENSE
 ```
+
+### SOLID Tasarım İlkeleri
+
+| İlke | Uygulama |
+|------|----------|
+| **S** — Tek Sorumluluk | `fluidlm/` yalnızca model kodu; `experiments/` yalnızca çalıştırılabilir scriptler; `checkpoints/` yalnızca ağırlıklar |
+| **O** — Açık/Kapalı | Yeni deney eklemek `fluidlm/`'e dokunmayı gerektirmiyor |
+| **I** — Arayüz Ayrımı | `fluid_ops`, `ns_layer`, `fluid_lm` bağımsız modüller — sadece ihtiyaç duyulan import edilir |
+| **D** — Bağımlılık Tersine Çevirme | Experimentler `fluidlm` soyutlamalarına bağlı, somut dosya yollarına değil |
+
+---
+
+## Sonuçlar
+
+### 07 — Karakter Düzeyi FluidLM (135M param)
+
+**Donanım:** NVIDIA RTX PRO 6000 Blackwell (102 GB VRAM)  
+**Veri:** TinyShakespeare (~1M karakter)  
+**Config:** d=1024, L=16, seq=512, dropout=0.2
+
+| Metrik | Değer |
+|--------|-------|
+| Val PPL | **5.14** |
+| Train PPL | 4.64 |
+| Gap Ratio | **1.11×** (overfitting yok) |
+| Eğitim süresi | ~21 dakika |
+| Erken dur | Epoch 29 / 200 |
+
+**Ezberleme Analizi (`07_eval_memorization.py`):**
+
+| Test | Sonuç |
+|------|-------|
+| PPL Gap (1.11×) | ✓ Genelleme |
+| LCS < 30 karakter | ✓ Verbatim kopya yok |
+| Self-BLEU-3 @ temp=0.8 | 0.635 — Normal |
+| Uydurma kelimeler (`glimagining`, `birtue`) | ✓ Ezber değil |
+| KL(üretim, train) | 0.049 (baz: 0.027) |
+| **Genel Karar** | **✓✓ GÜÇLÜ GENELLEME** |
+
+### 08 — Endüstri Ölçeği FluidLM (~950M param)
+
+**Donanım:** NVIDIA RTX PRO 6000 Blackwell (102 GB VRAM)  
+**Veri:** [FineWeb-Edu](https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu) — 500M token (streaming)  
+**Config:** d=2048, L=24, seq=1024, vocab=50257 (GPT-2 BPE / tiktoken)
+
+| Bileşen | Boyut |
+|---------|-------|
+| Token embedding | 103M param |
+| 24 × NS katmanı | 24 × 33.6M = 807M param |
+| **Toplam** | **~950M param** |
+
+**Bellek bütçesi:**
+
+```
+Parametreler (bf16)  : ~1.9 GB
+Optimizer state (fp32): ~3.8 GB
+Aktivasyonlar (grad ckpt): ~130 MB
+Toplam               : ~6 GB / 102 GB
+```
+
+**Eğitim şu an devam ediyor.**
 
 ---
 
@@ -56,19 +135,25 @@ neo_lang/
 
 ```bash
 pip install -r requirements.txt
+
+# 08 için ek paketler
+pip install tiktoken datasets
 ```
 
 ## Deneyleri Çalıştır
 
 ```bash
-# Deney 1: 1D difüzyon — "token = sıcaklık alanı" metaforu
-python experiments/01_1d_diffusion.py
+# 07 — Karakter düzeyi eğitim (Colab / Blackwell)
+python experiments/07_colab_a100.py
 
-# Deney 2: NS katmanı — basıncın attention gibi nasıl global etki yaptığı
-python experiments/02_ns_layer_test.py
+# 07 — Ezberleme analizi (eğitim bitti sonrası)
+python experiments/07_eval_memorization.py --ckpt checkpoints/07_best_model.pt
 
-# Deney 3: Gerçek eğitim — karakter düzeyi dil modeli
-python experiments/03_toy_lm_train.py
+# 08 — Endüstri ölçeği (tek GPU)
+python experiments/08_industry_scale.py
+
+# 08 — Çoklu GPU (DDP)
+torchrun --nproc_per_node=4 experiments/08_industry_scale.py
 ```
 
 ---
@@ -180,6 +265,40 @@ Bu tercih iki somut avantaj sağlar:
 2. **Model daha esnek** → sıkıştırılamazlık kısıtı öğrenmeyi gereğinden fazla sınırlamaz
 
 Gelecekte `∇·u = 0` zorlamak istenirse Helmholtz ayrışımı eklenerek `u ← u − ∇φ` projeksiyonu yapılabilir (bir FFT çözüm ek maliyet).
+
+---
+
+## Mimari Detaylar
+
+### Causal Navier-Stokes Operatörler
+
+Standart NS'te basınç tüm diziyi aynı anda görür (global). Dil modeli için **nedensellik** (causality) zorunlu — model gelecek tokenlara bakamaz. Bunu sağlamak için tüm operatörler **geriye fark** (backward difference) ile yeniden tanımlandı:
+
+```python
+# Gradient: sadece geçmiş tokenları kullan
+∇u[i] = u[i] - u[i-1]   (causal backward difference)
+
+# Laplacian:
+∇²u[i] = u[i] - 2u[i-1] + u[i-2]
+
+# Basınç: cumsum ile kausal integrasyon
+p = cumsum(-div) × α  →  normalize(detach std)
+```
+
+Bu tasarım, `α` ve `p_scale` parametrelerinin gradyan almasını korurken std normalizasyonunun `α`'nın etkisini silmesini engeller.
+
+### Fiziksel Parametre Öğrenimi
+
+Her NS katmanının 4 öğrenilebilir fiziksel parametresi vardır:
+
+| Parametre | Fiziksel Anlam | Başlangıç |
+|-----------|----------------|-----------|
+| `ν` (nu) | Viskozite — pürüzleştirme | `0.01 × (1 + 0.05i)` |
+| `Δt` (dt) | Zaman adımı — katman derinliği | `0.05 × (1 + 0.02i)` |
+| `α` (alpha) | Basınç ölçeği — global etki | 1.0 |
+| `p_scale` | Basınç gradyanı ağırlığı | 0.1 |
+
+Her katmana farklı başlangıç değeri verilir (simetri kırma) — böylece katmanlar farklı fiziksel dinamikler öğrenir.
 
 ---
 

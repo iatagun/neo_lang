@@ -1,5 +1,5 @@
 """
-src/__init__.py
+fluidlm/__init__.py — Navier-Stokes tabanlı dil modeli çekirdek kütüphanesi
 """
 from .fluid_ops import gradient, laplacian, divergence, solve_poisson
 from .ns_layer  import FluidLayer

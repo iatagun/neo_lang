@@ -34,7 +34,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from typing import List, Tuple
 
-from src.fluid_lm import FluidLM
+from fluidlm.fluid_lm import FluidLM
 
 torch.manual_seed(0)
 np.random.seed(0)
