@@ -31,6 +31,10 @@ Basınç alanı `p`, **tüm token dizisinden** aynı anda etkileniyor (Poisson d
 | Derinlik | Sabit N katman | **Adaptif** (ΔKE < eşik → dur) |
 | Teori temeli | İnductive bias | Akışkan dinamiği |
 
+![FluidLM 3D Mimari Görselleştirme](assets/13_architecture_3d.png)
+
+*Panel A: Hiz alanı ‖u‖ 3D yüzeyi (X=token, Y=katman, Z=norm, renk=basınç). Panel B: Norm ısı haritası. Panel C: Basınç alanı p. Panel D: ΔKE azalması + ν/Δt değerleri.*
+
 > **Parametre karışıklığı notu:** "Katman başı 4 skaler" yalnızca NS **routing** için geçerlidir. Her katmanın MLP bloğu (~8D²) iki modelde de aynıdır. 08 modelinde 24 katman × ~33.6M ≈ 807M parametrenin kaynağı MLP'dir (d=2048, FFN_ratio=4 → 2048×8192×2 = 33.6M/katman). NS routing payı 24 katmanda sadece **96 parametre**.
 
 ---
@@ -183,6 +187,12 @@ python experiments/11_flop_and_physics.py
 
 # 12 — Ablasyon: α ve p_scale gerekli mi?
 python experiments/12_ablation_alpha_pscale.py --conditions AB --epochs 100
+
+# 13 — 3D mimari görselleştirme (rastgele ağırlıklarla)
+python experiments/13_visualize_3d.py
+
+# 13 — 3D görselleştirme (eğitilmiş checkpoint ile)
+python experiments/13_visualize_3d.py --ckpt experiments/10_fluidlm_fair_best.pt
 
 # Tüm checkpoint'leri oku, karşılaştırma tablosu yaz
 python experiments/compare_results.py
