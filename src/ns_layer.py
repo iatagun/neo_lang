@@ -1,0 +1,226 @@
+"""
+ns_layer.py — Navier-Stokes Layer for FluidLM
+==============================================
+
+One time step of the 1-D incompressible Navier-Stokes equation:
+
+    ∂u/∂t = −(u·∇)u   −  ∇p   +  ν ∇²u
+              ↓            ↓        ↓
+          advection    pressure   viscosity
+         (meaning      (attention  (smoothing /
+          transport)    analog)     regularisation)
+
+Pressure is determined by the incompressibility constraint ∇·u = 0.
+Taking the divergence of the momentum equation gives the Poisson problem:
+
+    ∇²p = −∇·( (u·∇)u )
+
+which is solved spectrally (exact, O(L log L), autograd-compatible).
+
+Two integrators are available:
+  • 'euler'  — first-order forward Euler  (fast, 1 RHS evaluation)
+  • 'rk4'    — classical 4th-order Runge-Kutta  (accurate, 4 evaluations)
+
+Learnable parameters per layer
+-------------------------------
+  log_nu   — log of kinematic viscosity ν  (initialised from config)
+  log_dt   — log of time-step size    Δt  (initialised from config)
+
+Both are constrained positive via exp(·), so they never go negative.
+"""
+
+import math
+
+import torch
+import torch.nn as nn
+
+from .fluid_ops import gradient, laplacian, divergence, solve_poisson
+
+
+class FluidLayer(nn.Module):
+    """
+    One Navier-Stokes time step as a learnable neural-network layer.
+
+    Parameters
+    ----------
+    d_model : int
+        Embedding / velocity-field dimension D.
+    nu : float
+        Initial kinematic viscosity ν.  Controls how fast differences
+        between neighbouring token embeddings are smoothed out.
+        Analogy: dropout strength — high ν → aggressive smoothing.
+    dt : float
+        Initial time-step Δt.  Controls how far the field evolves per
+        layer.  Analogy: learning rate / residual gate.
+    integrator : str
+        'euler' or 'rk4'.  RK4 is recommended for production; Euler is
+        useful for fast prototyping.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        nu: float = 0.01,
+        dt: float = 0.1,
+        alpha: float = 1.0,
+        integrator: str = "rk4",
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.integrator = integrator
+
+        self.log_nu    = nn.Parameter(torch.tensor(math.log(nu)))
+        self.log_dt    = nn.Parameter(torch.tensor(math.log(dt)))
+        self.log_alpha = nn.Parameter(torch.tensor(math.log(alpha)))
+        # Learnable scale for the pressure gradient term.
+        # Initialised small so the model starts near a pure diffusion regime
+        # and learns how much pressure-driven interaction it needs.
+        self.log_p_scale = nn.Parameter(torch.tensor(math.log(0.1)))
+
+    # ── convenience properties ──────────────────────────────────────────────
+
+    @property
+    def nu(self) -> torch.Tensor:
+        return self.log_nu.exp()
+
+    @property
+    def dt(self) -> torch.Tensor:
+        return self.log_dt.exp()
+
+    @property
+    def alpha(self) -> torch.Tensor:
+        return self.log_alpha.exp()
+
+    @property
+    def p_scale(self) -> torch.Tensor:
+        """Learned scaling factor for pressure gradient contribution."""
+        return self.log_p_scale.exp()
+
+    # ── Compressible NS right-hand side  F(u) = −(u·∇)u − ∇p + ν∇²u ────────
+
+    def _rhs(self, u: torch.Tensor) -> torch.Tensor:
+        """
+        Evaluate the NS right-hand side at state u.
+
+        u : [B, L, D]  (B=batch, L=token positions = spatial axis, D=embedding)
+        returns du/dt : [B, L, D]
+
+        Coordinate convention
+        ─────────────────────
+        x = token position (sequence index).  Differential operators ∂/∂x
+        act along the L dimension.  D-dimensional embeddings are treated as
+        independent field components that all share the same spatial axis.
+        This is a 1-D, D-component vector field on a periodic domain.
+
+        Compressibility
+        ───────────────
+        We do NOT enforce ∇·u = 0.  The flow is compressible: divergence
+        is permitted, and no divergence-free projection is applied to u.
+        The pressure p is used purely as a global coupling mechanism —
+        it is derived from the local divergence of the advection field and
+        couples distant tokens through the spectral Poisson solve.
+
+        Backpropagation
+        ───────────────
+        With integrator='euler' this layer is u_new = u + dt·F(u), a plain
+        residual connection.  Autograd differentiates through it exactly in
+        O(n_layers · B · L · D) memory — no adjoint method is needed.
+        With integrator='rk4' the same holds with 4× the intermediate
+        tensors.  Adjoint (torchdiffeq) is an optional memory optimisation.
+
+        Advection  −(u·∇)u
+        ───────────────────
+        Transport speed = tanh(‖u‖₂) ∈ (0,1):  bounds the Reynolds number,
+        prevents norm explosion, keeps dynamics in the laminar regime.
+
+            speed  = tanh(‖u[b,i,:]‖₂)         [B, L, 1]
+            adv    = speed · ∂u/∂x              [B, L, D]
+
+        Pressure  −∇p  (global long-range coupling)
+        ────────────────────────────────────────────
+        p is found by solving the Helmholtz–Poisson equation:
+
+            (∇² − α²) p = −mean_d(∂adv_d/∂x)
+
+        The RHS uses the mean over D (scale-invariant divergence proxy).
+        ∇p is then broadcast across all D components, providing isotropic
+        long-range interaction analogous to attention.
+
+        Viscosity  ν∇²u  (local smoothing)
+        ────────────────────────────────────
+        Diffuses sharp embedding differences between neighbouring tokens.
+        """
+        # 1. Advection ─────────────────────────────────────────────────────
+        speed = torch.tanh(u.norm(dim=-1, keepdim=True))  # [B, L, 1]  ∈ (0,1)
+        adv   = speed * gradient(u)                       # [B, L, D]
+
+        # 2. Pressure (global long-range coupling) ─────────────────────────
+        rhs_p = -divergence(adv)                          # [B, L]  mean over D
+        p = solve_poisson(rhs_p, alpha=self.alpha)        # [B, L]
+        p = p / (p.std() + 1e-6)                         # normalise to unit std
+        p_grad = gradient(p.unsqueeze(-1))                # [B, L, 1]  ∂p/∂x
+        p_grad = self.p_scale * p_grad.expand_as(u)       # [B, L, D]  broadcast
+
+        # 3. Viscosity ──────────────────────────────────────────────────────
+        visc = self.nu * laplacian(u)                     # [B, L, D]
+
+        # 4. Combine  ───────────────────────────────────────────────────────
+        return -adv - p_grad + visc
+
+    # ── Integrators ─────────────────────────────────────────────────────────
+
+    def _euler(self, u: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        return u + dt * self._rhs(u)
+
+    def _rk4(self, u: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        """
+        Classical 4th-order Runge-Kutta integration.
+
+        k1 = F(u)
+        k2 = F(u + Δt/2 · k1)
+        k3 = F(u + Δt/2 · k2)
+        k4 = F(u + Δt   · k3)
+        u_new = u + Δt/6 · (k1 + 2k2 + 2k3 + k4)
+
+        RK4 achieves 4th-order accuracy with only 4 function evaluations.
+        For the NS equation it handles the nonlinear advection term much
+        better than Euler, especially at larger Δt.
+        """
+        k1 = self._rhs(u)
+        k2 = self._rhs(u + dt * 0.5 * k1)
+        k3 = self._rhs(u + dt * 0.5 * k2)
+        k4 = self._rhs(u + dt * k3)
+        return u + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    # ── Forward pass ────────────────────────────────────────────────────────
+
+    def forward(self, u: torch.Tensor):
+        """
+        Advance the velocity field by one time step.
+
+        Parameters
+        ----------
+        u : torch.Tensor, shape [B, L, D]
+            Current velocity field (token embeddings).
+
+        Returns
+        -------
+        u_new : torch.Tensor, shape [B, L, D]
+            Updated velocity field after one NS time step.
+        delta_ke : torch.Tensor, scalar
+            Mean kinetic-energy change  ⟨(u_new − u)²⟩.
+            Used as the adaptive-depth convergence criterion:
+            when delta_ke < threshold the flow has stabilised and
+            we can skip remaining layers.
+        """
+        dt = self.dt
+
+        if self.integrator == "euler":
+            u_new = self._euler(u, dt)
+        else:
+            u_new = self._rk4(u, dt)
+
+        # Normalised ΔKE: relative change (scale-invariant convergence criterion)
+        # delta_ke ≈ ||u_new - u||² / (||u||² + ε)
+        delta_ke = (u_new - u).pow(2).mean() / (u.pow(2).mean() + 1e-6)
+        return u_new, delta_ke
