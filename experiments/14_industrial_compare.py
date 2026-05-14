@@ -261,8 +261,7 @@ class TokenStream:
                 # OpenWebText: ~8M dokuman, ~8B token
                 ds = load_dataset("Skylion007/openwebtext",
                                   split="train",
-                                  streaming=True,
-                                  trust_remote_code=True)
+                                  streaming=True)
                 # train/val ayrımı: seed=42 ile shuffle edip %99/%1
                 ds = ds.shuffle(seed=42, buffer_size=10_000)
                 if split == "val":
@@ -325,8 +324,8 @@ class TokenStream:
                 master_print("[Data] Stream bitti, yeniden başlatılıyor...")
                 from datasets import load_dataset
                 ds = load_dataset("Skylion007/openwebtext",
-                                  split="train", streaming=True,
-                                  trust_remote_code=True).shuffle(seed=random.randint(0,9999))
+                                  split="train", streaming=True
+                                  ).shuffle(seed=random.randint(0,9999))
                 self._stream = iter(ds)
         return buf[:n_tokens]
 
@@ -708,7 +707,7 @@ def eval_wikitext103(model: nn.Module, device: torch.device,
         from datasets import load_dataset
         master_print("[WikiText] WikiText-103 yükleniyor...")
         ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
-                          split="test", trust_remote_code=True)
+                          split="test")
         text  = " ".join([r["text"] for r in ds if r["text"].strip()])
         ids   = torch.tensor(encode(text), dtype=torch.long)
         master_print(f"[WikiText] {len(ids):,} token")
@@ -1265,13 +1264,10 @@ def main():
     os.makedirs(OUT_DIR, exist_ok=True)
 
     # ── Vocab boyutunu belirle ────────────────────────────────────────────────
+    # tiktoken yüklüyse VOCAB=50257 zaten set edildi.
+    # Char fallback durumunda TokenStream.__init__ VOCAB'u set eder;
+    # o zaman ilk train_stream açılışında doğal olarak belirlenir.
     vocab_size = VOCAB if VOCAB else 65   # tiktoken=50257, char fallback=65
-    # Veri yükleme sırasında char fallback VOCAB'u set eder; burası sadece ilk
-    # model oluşturma için — gerçek vocab TokenStream.__init__'te set edilir.
-    # Geçici stream açarak vocab'u önce belirle:
-    _tmp = TokenStream("train", SCALE_CONFIGS["S"].seq_len, device)
-    vocab_size = VOCAB if VOCAB else (65 if vocab_size == 65 else vocab_size)
-    del _tmp
 
     master_print(f"\n[Config] vocab={vocab_size}  scales={args.scale}  "
                  f"model={args.model}  tokens={args.tokens:.0e}")
