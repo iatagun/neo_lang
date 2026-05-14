@@ -31,53 +31,58 @@ import torch
 # Finite-difference operators  (periodic BCs via torch.roll)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def gradient(u: torch.Tensor) -> torch.Tensor:
+def gradient(u: torch.Tensor, causal: bool = False) -> torch.Tensor:
     """
-    Central-difference gradient  ∂u/∂x  along the sequence (L) dimension.
+    Gradient ∂u/∂x along the sequence (L) dimension.
 
-    Periodic boundary conditions: the sequence is treated as a ring.
-    Grid spacing h = 1 (token index step).
+    causal=False (default): centered difference O(h²), periodic BCs.
+        ∂u/∂x [i] ≈ (u[i+1] − u[i−1]) / 2
+        Used for analysis / non-autoregressive tasks.
 
-      ∂u/∂x [i] ≈ (u[i+1] − u[i−1]) / 2
+    causal=True: backward difference O(h), zero-padded at i=0.
+        ∂u/∂x [i] ≈ u[i] − u[i−1]      (u[-1] = 0 by padding)
+        REQUIRED for autoregressive language modelling — prevents
+        position i from seeing future tokens i+1, i+2, …
 
     u : [B, L, D]  →  ∂u/∂x : [B, L, D]
     """
+    if causal:
+        # F.pad: (last_dim_left, last_dim_right, second_last_left, …)
+        # We pad along dim=1 (L): one zero frame on the left, none on right.
+        import torch.nn.functional as _F
+        padded = _F.pad(u, (0, 0, 1, 0))   # [B, L+1, D]
+        return u - padded[:, :-1, :]        # u[i] - u[i-1]
     return (torch.roll(u, -1, dims=1) - torch.roll(u, 1, dims=1)) * 0.5
 
 
-def laplacian(u: torch.Tensor) -> torch.Tensor:
+def laplacian(u: torch.Tensor, causal: bool = False) -> torch.Tensor:
     """
-    Second-order central-difference Laplacian  ∂²u/∂x²  along L.
+    Second-order Laplacian ∂²u/∂x² along L.
 
-      ∂²u/∂x² [i] ≈ u[i+1] − 2u[i] + u[i−1]
+    causal=False: central difference, periodic BCs.
+        ∂²u/∂x² [i] ≈ u[i+1] − 2u[i] + u[i−1]
 
-    This is the discrete diffusion operator. Large positive values mean
-    the token is "colder" than its neighbours (it will be pushed up);
-    large negative values mean it is "hotter" (it will be pushed down).
+    causal=True: backward second difference, zero-padded.
+        ∂²u/∂x² [i] ≈ u[i] − 2u[i−1] + u[i−2]
 
     u : [B, L, D]  →  ∇²u : [B, L, D]
     """
+    if causal:
+        import torch.nn.functional as _F
+        padded = _F.pad(u, (0, 0, 2, 0))   # [B, L+2, D]
+        return u - 2 * padded[:, 1:-1, :] + padded[:, :-2, :]
     return torch.roll(u, -1, dims=1) - 2.0 * u + torch.roll(u, 1, dims=1)
 
 
-def divergence(u: torch.Tensor) -> torch.Tensor:
+def divergence(u: torch.Tensor, causal: bool = False) -> torch.Tensor:
     """
     Mean divergence field along the sequence axis.
 
-    For a 1-D D-component field, the full divergence would require one
-    spatial axis per field component.  We have only one spatial axis (L),
-    so we define:
-
         div(u)[b, i] = mean_d( ∂u_d/∂x [b, i, d] )
-
-    Using the *mean* (not sum) makes the quantity scale-invariant with
-    respect to embedding dimension D, which stabilises training when D
-    is varied.  The resulting scalar field is passed as the RHS to
-    solve_poisson to compute the global coupling pressure p.
 
     u : [B, L, D]  →  div(u) : [B, L]
     """
-    return gradient(u).mean(dim=-1)
+    return gradient(u, causal=causal).mean(dim=-1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

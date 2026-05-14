@@ -64,17 +64,16 @@ class FluidLayer(nn.Module):
         dt: float = 0.1,
         alpha: float = 1.0,
         integrator: str = "rk4",
+        causal: bool = True,
     ):
         super().__init__()
-        self.d_model = d_model
+        self.d_model    = d_model
         self.integrator = integrator
+        self.causal     = causal
 
-        self.log_nu    = nn.Parameter(torch.tensor(math.log(nu)))
-        self.log_dt    = nn.Parameter(torch.tensor(math.log(dt)))
-        self.log_alpha = nn.Parameter(torch.tensor(math.log(alpha)))
-        # Learnable scale for the pressure gradient term.
-        # Initialised small so the model starts near a pure diffusion regime
-        # and learns how much pressure-driven interaction it needs.
+        self.log_nu      = nn.Parameter(torch.tensor(math.log(nu)))
+        self.log_dt      = nn.Parameter(torch.tensor(math.log(dt)))
+        self.log_alpha   = nn.Parameter(torch.tensor(math.log(alpha)))
         self.log_p_scale = nn.Parameter(torch.tensor(math.log(0.1)))
 
     # ── convenience properties ──────────────────────────────────────────────
@@ -151,18 +150,26 @@ class FluidLayer(nn.Module):
         Diffuses sharp embedding differences between neighbouring tokens.
         """
         # 1. Advection ─────────────────────────────────────────────────────
-        speed = torch.tanh(u.norm(dim=-1, keepdim=True))  # [B, L, 1]  ∈ (0,1)
-        adv   = speed * gradient(u)                       # [B, L, D]
+        speed = torch.tanh(u.norm(dim=-1, keepdim=True))         # [B, L, 1]
+        adv   = speed * gradient(u, causal=self.causal)          # [B, L, D]
 
-        # 2. Pressure (global long-range coupling) ─────────────────────────
-        rhs_p = -divergence(adv)                          # [B, L]  mean over D
-        p = solve_poisson(rhs_p, alpha=self.alpha)        # [B, L]
-        p = p / (p.std() + 1e-6)                         # normalise to unit std
-        p_grad = gradient(p.unsqueeze(-1))                # [B, L, 1]  ∂p/∂x
-        p_grad = self.p_scale * p_grad.expand_as(u)       # [B, L, D]  broadcast
+        # 2. Pressure (long-range coupling) ────────────────────────────────
+        if self.causal:
+            # Causal pressure: cumulative sum of divergence (left-to-right only).
+            # p[i] = -sum_{j<=i} div(adv)[j] / alpha
+            # Provides global coupling without leaking future tokens.
+            div_adv = divergence(adv, causal=True)               # [B, L]
+            p = torch.cumsum(-div_adv, dim=1) / (self.alpha + 1e-6)
+        else:
+            # Non-causal: spectral FFT Poisson solve (periodic BCs).
+            rhs_p = -divergence(adv, causal=False)
+            p = solve_poisson(rhs_p, alpha=self.alpha)
+        p = p / (p.std(dim=1, keepdim=True) + 1e-6)              # normalise
+        p_grad = gradient(p.unsqueeze(-1), causal=self.causal)   # [B, L, 1]
+        p_grad = self.p_scale * p_grad.expand_as(u)              # [B, L, D]
 
         # 3. Viscosity ──────────────────────────────────────────────────────
-        visc = self.nu * laplacian(u)                     # [B, L, D]
+        visc = self.nu * laplacian(u, causal=self.causal)        # [B, L, D]
 
         # 4. Combine  ───────────────────────────────────────────────────────
         return -adv - p_grad + visc

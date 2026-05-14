@@ -96,6 +96,7 @@ class FluidLM(nn.Module):
         convergence_threshold: float = 1e-4,
         min_steps: int = 3,
         dropout: float = 0.1,
+        causal: bool = True,
     ):
         super().__init__()
 
@@ -111,7 +112,8 @@ class FluidLM(nn.Module):
 
         # ── Navier-Stokes layers ─────────────────────────────────────────
         self.layers = nn.ModuleList([
-            FluidLayer(d_model, nu=nu, dt=dt, alpha=alpha, integrator=integrator)
+            FluidLayer(d_model, nu=nu, dt=dt, alpha=alpha, integrator=integrator,
+                       causal=causal)
             for _ in range(n_layers)
         ])
 
