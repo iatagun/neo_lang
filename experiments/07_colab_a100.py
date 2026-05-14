@@ -183,10 +183,14 @@ class CausalFluidLM(nn.Module):
         self.pos_emb   = nn.Embedding(max_seq_len, d_model)
         self.emb_drop  = nn.Dropout(dropout)
 
+        # Her katman icin hafif pertuerbasyon — simetri kirma, parametre cesitliligi
         self.layers = nn.ModuleList([
-            CausalFluidLayer(d_model, nu=nu, dt=dt, alpha=alpha,
+            CausalFluidLayer(d_model,
+                             nu=nu    * (1.0 + 0.05 * i),
+                             dt=dt    * (1.0 + 0.02 * i),
+                             alpha=alpha,
                              mlp_ratio=mlp_ratio, dropout=dropout)
-            for _ in range(n_layers)
+            for i in range(n_layers)
         ])
 
         self.norm    = nn.LayerNorm(d_model)
@@ -401,7 +405,7 @@ for epoch in range(1, EPOCHS + 1):
         is_last = (step == len(train_batches) - 1)
         accum_step = (step + 1) % GRAD_ACCUM == 0 or is_last
 
-        with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
+        with torch.amp.autocast('cuda', enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
             logits = model(x, use_checkpoint=USE_CKPT)
             loss   = F.cross_entropy(logits.reshape(-1, VOCAB_SIZE),
                                      y.reshape(-1), ignore_index=PAD_ID)
@@ -425,8 +429,8 @@ for epoch in range(1, EPOCHS + 1):
     model.eval()
     val_batches = make_batches(val_ids, SEQ_LEN, BATCH_SIZE, shuffle=False)
     v_loss = 0.0
-    with torch.no_grad(), torch.cuda.amp.autocast(
-            enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
+    with torch.no_grad(), torch.amp.autocast(
+            'cuda', enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
         for x, y in val_batches:
             logits = model(x, use_checkpoint=False)
             v_loss += F.cross_entropy(logits.reshape(-1, VOCAB_SIZE),
@@ -492,22 +496,45 @@ if USE_BF16:
 
 @torch.no_grad()
 def generate(prompt_text: str, max_new: int = 400,
-             temperature: float = 0.8, top_k: int = 10) -> str:
-    ids = torch.tensor([encode(prompt_text)], dtype=torch.long, device=DEVICE)
+             temperature: float = 0.8, top_k: int = 10,
+             rep_penalty: float = 1.3) -> str:
+    """
+    rep_penalty: >1 → daha once uretilen tokenlarin logitini cez.
+    1.0 = devre disi.
+    """
+    prompt_ids = encode(prompt_text)
+    ids = torch.tensor([prompt_ids], dtype=torch.long, device=DEVICE)
     ids = ids[:, -(SEQ_LEN + 4):]
+    generated: list[int] = []
+
     for _ in range(max_new):
-        with torch.cuda.amp.autocast(enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
+        with torch.amp.autocast('cuda', enabled=(DEVICE.type == "cuda"), dtype=DTYPE):
             logits = model(ids, use_checkpoint=False)
         next_l = logits[0, -1, :].float() / max(temperature, 1e-6)
+
+        # Tekrar cezasi: daha once gorulen tokenlarin skorunu dusur
+        if rep_penalty != 1.0 and generated:
+            seen = set(generated[-64:])  # son 64 tokendan
+            for tok in seen:
+                if next_l[tok] > 0:
+                    next_l[tok] = next_l[tok] / rep_penalty
+                else:
+                    next_l[tok] = next_l[tok] * rep_penalty
+
         if top_k > 0:
             topk_v, _ = torch.topk(next_l, min(top_k, next_l.size(-1)))
             next_l = next_l.masked_fill(next_l < topk_v[-1], -1e9)
         probs = torch.softmax(next_l, dim=-1)
         nid   = torch.multinomial(probs, 1).unsqueeze(0)
+        tok   = nid.item()
+        generated.append(tok)
         ids   = torch.cat([ids, nid], dim=1)[:, -(SEQ_LEN + 4):]
-        if nid.item() == EOS_ID:
+        if tok == EOS_ID:
             break
-    return prompt_text + decode(ids[0].tolist())
+
+    # ids[0] = [prompt_tokens..., generated_tokens...]
+    # prompt zaten icinde, tekrar eklemiyoruz
+    return decode(ids[0].tolist())
 
 prompts_cfg = [
     ("HAMLET greedy",    "HAMLET:",           0.3,  5),
