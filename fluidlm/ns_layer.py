@@ -74,7 +74,7 @@ class FluidLayer(nn.Module):
         self.log_nu      = nn.Parameter(torch.tensor(math.log(nu)))
         self.log_dt      = nn.Parameter(torch.tensor(math.log(dt)))
         self.log_alpha   = nn.Parameter(torch.tensor(math.log(alpha)))
-        self.p_scale_raw = nn.Parameter(torch.tensor(0.1))   # direct (not log-space)
+        self.p_scale_raw = nn.Parameter(torch.tensor(1.0))   # 1.0 init: α gradyanı için yeterli sinyal
 
     # ── convenience properties ──────────────────────────────────────────────
 
@@ -156,15 +156,17 @@ class FluidLayer(nn.Module):
         # 2. Pressure (long-range coupling) ────────────────────────────────
         if self.causal:
             # Causal pressure: cumulative sum of divergence (left-to-right only).
-            # p[i] = -sum_{j<=i} div(adv)[j] / alpha
-            # Provides global coupling without leaking future tokens.
+            # Normalise the cumsum BEFORE dividing by alpha so that alpha is NOT
+            # cancelled by std(cumsum/alpha) = std(cumsum)/alpha.
             div_adv = divergence(adv, causal=True)               # [B, L]
-            p = torch.cumsum(-div_adv, dim=1) / (self.alpha + 1e-6)
+            cumsum  = torch.cumsum(-div_adv, dim=1)              # [B, L]
+            cumsum  = cumsum / (cumsum.std(dim=1, keepdim=True).detach() + 1e-6)  # normalise first
+            p = cumsum / (self.alpha + 1e-6)                     # alpha still in gradient path
         else:
             # Non-causal: spectral FFT Poisson solve (periodic BCs).
             rhs_p = -divergence(adv, causal=False)
             p = solve_poisson(rhs_p, alpha=self.alpha)
-        p = p / (p.std(dim=1, keepdim=True).detach() + 1e-6)     # normalise (detach: α gradyanı korunur)
+            p = p / (p.std(dim=1, keepdim=True).detach() + 1e-6)  # normalise
         p_grad = gradient(p.unsqueeze(-1), causal=self.causal)   # [B, L, 1]
         p_grad = self.p_scale * p_grad.expand_as(u)              # [B, L, D]
 
