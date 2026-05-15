@@ -838,11 +838,31 @@ def train_one(
     tokens_seen  = 0
     t0_global    = time.time()
     throughput_samples: List[float] = []
+    resume_step  = 0
+
+    # ── Resume: mevcut checkpoint varsa yükle ────────────────────────────────
+    if os.path.exists(best_ckpt_path):
+        master_print(f"  [Resume] {best_ckpt_path} bulundu, yükleniyor...")
+        resume_ckpt = torch.load(best_ckpt_path, map_location=device,
+                                  weights_only=True)
+        raw_model.load_state_dict(resume_ckpt["model_state"])
+        optimizer.load_state_dict(resume_ckpt["optimizer_state"])
+        resume_step      = resume_ckpt.get("step", 0) + 1
+        best_val_ppl     = resume_ckpt.get("val_ppl", float("inf"))
+        tokens_seen      = resume_step * effective_batch_tokens
+        master_print(f"  [Resume] step={resume_step}  "
+                     f"tokens={tokens_seen/1e9:.2f}B  "
+                     f"best_ppl={best_val_ppl:.4f}")
+        # Veri akışını resume_step'e ilerlet (streaming)
+        skip_batches = resume_step * grad_accum * batch_size
+        master_print(f"  [Resume] {skip_batches:,} batch atlanıyor...")
+        for _ in range(skip_batches):
+            train_stream.get_batch(batch_size)
 
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    for step in range(total_steps):
+    for step in range(resume_step, total_steps):
         # LR güncelle
         lr_now = get_lr(step, warmup_steps, total_steps, args.lr, args.min_lr)
         for pg in optimizer.param_groups:
@@ -1303,12 +1323,30 @@ def main():
     def seeds_for(scale):
         return args.seeds if scale == "S" else args.seeds[:1]
 
+    # ── JSON'dan tamamlanan run'ları yükle (crash recovery) ──────────────────
+    json_path   = os.path.join(OUT_DIR, "14_industrial_compare.json")
     all_results: List[dict] = []
+    completed_ids: set = set()
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                all_results = json.load(f)
+            completed_ids = {r["run_id"] for r in all_results
+                             if r.get("best_val_ppl", -1) > 0}
+            master_print(f"[Resume] JSON yüklendi: {len(completed_ids)} run tamamlanmış: "
+                         f"{sorted(completed_ids)}")
+        except Exception as e:
+            master_print(f"[Resume] JSON okunamadı ({e}), sıfırdan başlıyor.")
+            all_results = []
 
     for scale in scales_to_run:
         sc = SCALE_CONFIGS[scale]
         for model_type in models_to_run:
             for seed in seeds_for(scale):
+                run_id_check = f"14_{model_type}_{sc.name}_s{seed}"
+                if run_id_check in completed_ids:
+                    master_print(f"  [Skip] {run_id_check} zaten tamamlandı.")
+                    continue
                 result = train_one(
                     model_type=model_type,
                     scale_cfg=sc,
