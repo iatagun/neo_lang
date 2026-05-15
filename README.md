@@ -574,6 +574,23 @@ Mevcut implementasyonda sıkıştırılamazlık zorlanmıyor (compressible NS). 
 
 ---
 
+---
+
+## Dokümantasyon
+
+Ayrıntılı teknik belgeler `docs/` klasöründe:
+
+| Dosya | İçerik |
+|-------|--------|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | NS matematiği, veri akışı, adaptif derinlik, bellek analizi, ölçek konfigürasyonları |
+| [docs/API_REFERENCE.md](docs/API_REFERENCE.md) | `fluid_ops`, `FluidLayer`, `FluidLM` — tüm sınıf ve fonksiyon imzaları, örnekler |
+| [docs/EXPERIMENTS.md](docs/EXPERIMENTS.md) | Her deneyin amacı, yöntemi ve bulguları (01'den 14'e) |
+| [docs/RESEARCH.md](docs/RESEARCH.md) | RQ1/RQ2/RQ3, Chinchilla metodolojisi, izolasyon tasarımı, mevcut bulgular, açık sorular |
+| [GLOSSARY.md](GLOSSARY.md) | u, p, adv, ν, dt, α, p_scale — fizik terimlerinin LM karşılıkları |
+| [MATH_FOR_EVERYONE.md](MATH_FOR_EVERYONE.md) | Sıfırdan anlatım: embedding, gradient, basınç — yalnızca dört işlem kullanarak |
+
+---
+
 ## Referanslar
 
 - Navier, C-L. (1827). *Mémoire sur les lois du mouvement des fluides.*
