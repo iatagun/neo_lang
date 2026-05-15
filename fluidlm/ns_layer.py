@@ -74,7 +74,7 @@ class FluidLayer(nn.Module):
         self.log_nu      = nn.Parameter(torch.tensor(math.log(nu)))
         self.log_dt      = nn.Parameter(torch.tensor(math.log(dt)))
         self.log_alpha   = nn.Parameter(torch.tensor(math.log(alpha)))
-        self.log_p_scale = nn.Parameter(torch.tensor(math.log(0.1)))
+        self.p_scale_raw = nn.Parameter(torch.tensor(0.1))   # direct (not log-space)
 
     # ── convenience properties ──────────────────────────────────────────────
 
@@ -93,7 +93,7 @@ class FluidLayer(nn.Module):
     @property
     def p_scale(self) -> torch.Tensor:
         """Learned scaling factor for pressure gradient contribution."""
-        return self.log_p_scale.exp()
+        return self.p_scale_raw
 
     # ── Compressible NS right-hand side  F(u) = −(u·∇)u − ∇p + ν∇²u ────────
 
@@ -164,7 +164,7 @@ class FluidLayer(nn.Module):
             # Non-causal: spectral FFT Poisson solve (periodic BCs).
             rhs_p = -divergence(adv, causal=False)
             p = solve_poisson(rhs_p, alpha=self.alpha)
-        p = p / (p.std(dim=1, keepdim=True) + 1e-6)              # normalise
+        p = p / (p.std(dim=1, keepdim=True).detach() + 1e-6)     # normalise (detach: α gradyanı korunur)
         p_grad = gradient(p.unsqueeze(-1), causal=self.causal)   # [B, L, 1]
         p_grad = self.p_scale * p_grad.expand_as(u)              # [B, L, D]
 

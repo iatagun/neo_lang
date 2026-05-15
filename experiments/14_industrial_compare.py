@@ -801,15 +801,25 @@ def train_one(
         raw_model = model.module
 
     # ── Optimizer (AdamW, GPT-3 standardı) ───────────────────────────────────
-    # Decay: weight matrixleri; no-decay: bias, layernorm, embeddings
-    decay_params   = [p for n,p in raw_model.named_parameters()
-                      if p.requires_grad and p.dim() >= 2]
-    nodecay_params = [p for n,p in raw_model.named_parameters()
-                      if p.requires_grad and p.dim() < 2]
-    optimizer = torch.optim.AdamW([
-        {"params": decay_params,   "weight_decay": args.weight_decay},
-        {"params": nodecay_params, "weight_decay": 0.0},
-    ], lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
+    # Physics params (NS katman): 10× LR + hafif decay — α/p_scale serbestçe öğrensin
+    # GPT modelinde bu isimler yoktur → physics_params boş olur, sorun değil
+    PHYSICS_NAMES = {'log_nu', 'log_dt', 'log_alpha', 'p_scale_raw'}
+    physics_params = [p for n, p in raw_model.named_parameters()
+                      if p.requires_grad and any(k in n for k in PHYSICS_NAMES)]
+    decay_params   = [p for n, p in raw_model.named_parameters()
+                      if p.requires_grad and p.dim() >= 2
+                      and not any(k in n for k in PHYSICS_NAMES)]
+    nodecay_params = [p for n, p in raw_model.named_parameters()
+                      if p.requires_grad and p.dim() < 2
+                      and not any(k in n for k in PHYSICS_NAMES)]
+    pg_list = [
+        {"params": physics_params,  "lr": args.lr * 10, "weight_decay": 0.01,             "lr_scale": 10.0},
+        {"params": decay_params,    "weight_decay": args.weight_decay,                     "lr_scale": 1.0},
+        {"params": nodecay_params,  "weight_decay": 0.0,                                  "lr_scale": 1.0},
+    ]
+    # Boş param gruplarını çıkar (GPT için physics_params boş olabilir)
+    pg_list = [pg for pg in pg_list if len(pg["params"]) > 0]
+    optimizer = torch.optim.AdamW(pg_list, lr=args.lr, betas=(0.9, 0.95), eps=1e-8)
 
     # ── Batch size ────────────────────────────────────────────────────────────
     if BATCH_OVERRIDE:
@@ -866,7 +876,7 @@ def train_one(
         # LR güncelle
         lr_now = get_lr(step, warmup_steps, total_steps, args.lr, args.min_lr)
         for pg in optimizer.param_groups:
-            pg["lr"] = lr_now
+            pg["lr"] = lr_now * pg.get("lr_scale", 1.0)
 
         # Gradient accumulation
         t_step = time.time()
