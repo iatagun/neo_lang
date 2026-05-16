@@ -85,13 +85,13 @@ divergence(u: torch.Tensor, causal: bool = False) -> torch.Tensor
 Helmholtz–Poisson denklemi `(∇² − α²) p = rhs` için spektral çözücü.
 
 ```python
-solve_poisson(rhs: torch.Tensor, alpha: float = 1.0) -> torch.Tensor
+solve_poisson(rhs: torch.Tensor, alpha = 1.0) -> torch.Tensor  # alpha: float | Tensor
 ```
 
-| Parametre | Tip    | Varsayılan | Açıklama |
-|-----------|--------|------------|----------|
-| `rhs`     | Tensor | —          | `[B, L]` — sağ el tarafı |
-| `alpha`   | float  | `1.0`      | Helmholtz sabiti ≥ 0; 0 → standart Poisson |
+| Parametre | Tip           | Varsayılan | Açıklama |
+|-----------|---------------|------------|----------|
+| `rhs`     | Tensor        | —          | `[B, L]` — sağ el tarafı |
+| `alpha`   | float\|Tensor | `1.0`      | Helmholtz sabiti ≥ 0; 0 → standart Poisson |
 
 **Dönüş:** `[B, L]` — basınç alanı `p`.
 
@@ -129,6 +129,8 @@ FluidLayer(
     alpha:      float = 1.0,
     integrator: str   = 'rk4',
     causal:     bool  = True,
+    mlp_ratio:  int   = 4,
+    dropout:    float = 0.0,
 )
 ```
 
@@ -140,6 +142,8 @@ FluidLayer(
 | `alpha`     | float | `1.0`      | Helmholtz sabiti başlangıç değeri |
 | `integrator`| str   | `'rk4'`    | `'euler'` veya `'rk4'` |
 | `causal`    | bool  | `True`     | Dil modeli için `True` (autoregressive) |
+| `mlp_ratio` | int   | `4`        | MLP hidden boyutu çarpanı (hidden = d_model × mlp_ratio) |
+| `dropout`   | float | `0.0`      | MLP dropout oranı |
 
 ### Learnable Parametreler
 
@@ -207,6 +211,7 @@ FluidLM(
     min_steps:              int   = 3,
     dropout:                float = 0.1,
     causal:                 bool  = True,
+    mlp_ratio:              int   = 4,
 )
 ```
 
@@ -222,8 +227,9 @@ FluidLM(
 | `integrator`           | str   | `'rk4'`    | `'euler'` veya `'rk4'` |
 | `convergence_threshold`| float | `1e-4`     | Adaptif durdurma için ΔKE eşiği |
 | `min_steps`            | int   | `3`        | Adaptif modda minimum katman sayısı |
-| `dropout`              | float | `0.1`      | Embedding dropout oranı |
+| `dropout`              | float | `0.1`      | Embedding ve MLP dropout oranı |
 | `causal`               | bool  | `True`     | Tüm katmanlara nedensellik modu |
+| `mlp_ratio`            | int   | `4`        | MLP hidden boyutu çarpanı (tüm katmanlara aktarılır) |
 
 ### `forward(input_ids, adaptive=False, return_stats=False)`
 

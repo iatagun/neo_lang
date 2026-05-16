@@ -29,9 +29,9 @@ Architecture overview
 Key differences from a Transformer
 ────────────────────────────────────
   ✗ No Q / K / V matrices per layer   → attention emerges from ∇p
-  ✗ No feed-forward sublayers         → advection provides nonlinearity
+  ✓ Standard MLP / FFN sublayer       → same capacity as Transformer (mlp_ratio=4)
   ✗ No fixed depth                    → adaptive early-stopping on ΔKE
-  ✓ Fewer parameters per layer        → only 2 scalars (ν, Δt) + ops
+  ✓ 4 routing scalars per layer       → (ν, Δt, α, p_scale) vs ~2.4M MHA params
   ✓ Physically motivated dynamics     → less inductive bias to tune
   ✓ Interpretable internals           → ν, Δt, pressure field are meaningful
 

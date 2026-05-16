@@ -66,21 +66,24 @@ Input token IDs  [B, L]
 │  u = Dropout(u)                                      │
 └────────────────────┬────────────────────────────────┘
                      │  u₀ [B, L, D]
-        ┌────────────▼────────────┐
-        │  FluidLayer 1           │
-        │  u₁, ΔKE₁ = layer(u₀)  │
-        └────────────┬────────────┘
-                     │  u₁
-        ┌────────────▼────────────┐
-        │  FluidLayer 2           │
-        │  u₂, ΔKE₂ = layer(u₁)  │
-        └────────────┬────────────┘
+        ┌─────────────────────────────────────────────────────┐
+        │  FluidLayer 1                                  │
+        │  u1 = norm1(u0)                                │
+        │  u_ns = u1 + dt·F(u1)   ← NS sublayer         │
+        │  u  = u0 + (u_ns − u1)  ← residual            │
+        │  ΔKE = ‖u_ns − u1‖² / ‖u1‖²                    │
+        │  u  = u + mlp(norm2(u))  ← MLP sublayer        │
+        └─────────────────────────────────────────────────────┘
+                     │  u₁, ΔKE₁
+        ┌─────────────────────────────────────────────────────┐
+        │  FluidLayer 2                                  │
+        │  (aynı yapı: norm1 → NS → residual + ΔKE, norm2 → MLP) │
+        └─────────────────────────────────────────────────────┘
                      │  ⋮
-        ┌────────────▼────────────┐
-        │  FluidLayer N           │
-        │  u_N, ΔKE_N = layer(…) │
-        │  [adaptif: ΔKE < ε → dur] │
-        └────────────┬────────────┘
+        ┌─────────────────────────────────────────────────────┐
+        │  FluidLayer N                                  │
+        │  [adaptif: ΔKE < ε → dur]                      │
+        └─────────────────────────────────────────────────────┘
                      │  u_T [B, L, D]
         ┌────────────▼────────────┐
         │  LayerNorm(u_T)          │
@@ -149,14 +152,26 @@ Causal modda:
 F(u) = −adv − p_scale · ∇p + ν · ∇²u
 ```
 
-### 3.5 Euler Entegrasyonu
+### 3.5 İleri Geçiş (Pre-norm + Residual + MLP)
+
+`forward(u)` iki sublayer çalıştırır:
 
 ```
-u_new = u + dt · F(u)
-ΔKE   = ‖u_new − u‖²_mean
+# --- Sublayer 1: NS routing ---
+u1    = norm1(u)                        # pre-norm (u1 cache’lenir)
+u_ns  = u1 + dt · F(u1)               # Euler  (ya da RK4)
+u     = u + (u_ns − u1)               # residual bağlantısı
+ΔKE   = ‖u_ns − u1‖² / ‖u1‖²          # NS değişimi (MLP dahil değil)
+
+# --- Sublayer 2: MLP (knowledge storage) ---
+u     = u + mlp(norm2(u))              # pre-norm + residual
 ```
+
+**ΔKE, MLP’den önce hesaplanır.** Adaptif derinlik için NS routing'in ne kadar değişimi götrdüğü ölçülmek istenir, MLP'ın katkısı değil.
 
 ### 3.6 RK4 Entegrasyonu
+
+Sublayer 1 içinde Euler yerine RK4:
 
 ```
 k1 = F(u)
@@ -200,7 +215,7 @@ Eğer `ΔKE < convergence_threshold` ve en az `min_steps` katman çalıştıysa 
 ```python
 # FluidLM.forward() içinde
 for i, layer in enumerate(self.layers):
-    u, delta_ke = layer(u)
+    u, delta_ke = layer(u)         # ΔKE = NS routing değişimi (MLP dahil değil)
     if adaptive and i >= min_steps - 1:
         if delta_ke < convergence_threshold:
             break
@@ -269,8 +284,10 @@ fluid_ops.py
 ns_layer.py
   └── FluidLayer(nn.Module)
         ├── Parametreler: log_nu, log_dt, log_alpha, log_p_scale
-        ├── _rhs(u)      — NS sağ el tarafı, fluid_ops kullanır
-        └── forward(u)   — Euler veya RK4 entegrasyonu + ΔKE
+        ├── norm1, norm2   — pre-norm (NS sublayer ve MLP sublayer)
+        ├── mlp            — Linear → GELU → Dropout → Linear → Dropout
+        ├── _rhs(u)        — NS sağ el tarafı, fluid_ops kullanır
+        └── forward(u)     — norm1→NS→residual + ΔKE, norm2→MLP→residual
 
 fluid_lm.py
   └── FluidLM(nn.Module)

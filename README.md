@@ -24,10 +24,10 @@ Basınç alanı `p`, **tüm token dizisinden** aynı anda etkileniyor (Poisson d
 | Özellik | Transformer | FluidLM |
 |---|---|---|
 | Token etkileşimi | Q·Kᵀ attention matrisi | ∇p basınç alanı (Poisson) |
-| Nonlinearity | FFN (2 linear + ReLU) | Adveksiyon (u·∇)u |
-| Regularizasyon | Dropout + LayerNorm | Viskozite ν∇²u |
-| **Routing** parametresi/katman | ~4D² (MHA, d=768 → ~2.4M) | **4 skaler** (ν, Δt, α, p_scale) |
-| **MLP** parametresi/katman | ~8D² (FFN) | ~8D² (FFN, aynı) |
+| Routing (katman başı) | ~4D² (MHA, d=768 → ~2.4M) | **4 skaler** (ν, Δt, α, p_scale) |
+| MLP / FFN sublayer | ✓ ~8D² | ✓ ~8D² (aynı) |
+| Pre-norm pattern | Pre-LN (norm → attn → residual) | Pre-LN (norm1 → NS → residual, norm2 → MLP → residual) |
+| Regularizasyon | Dropout + LayerNorm | Viskozite ν∇²u + Dropout + LayerNorm |
 | Derinlik | Sabit N katman | **Adaptif** (ΔKE < eşik → dur) |
 | Teori temeli | İnductive bias | Akışkan dinamiği |
 
@@ -46,8 +46,14 @@ neo_lang/
 ├── fluidlm/                        # Çekirdek kütüphane (pip install -e . ile kullanılabilir)
 │   ├── __init__.py
 │   ├── fluid_ops.py                # ∇, ∇², div, Poisson çözücü (causal, FFT tabanlı)
-│   ├── ns_layer.py                 # Navier-Stokes katmanı (causal=True default)
+│   ├── ns_layer.py                 # Navier-Stokes katmanı — NS sublayer + MLP sublayer
 │   └── fluid_lm.py                 # Tam dil modeli + adaptif derinlik + üretim
+│
+├── fluidlm_v2/                     # V2 deneysel paket (O(h²) gradient, channel_mix)
+│   ├── __init__.py
+│   ├── fluid_ops.py                # O(h²) causal gradient, bfloat16-safe Poisson
+│   ├── ns_layer.py                 # Euler default, channel_mix zero-init
+│   └── fluid_lm.py                 # make_optimizer_groups dahil
 │
 ├── experiments/                    # Çalıştırılabilir scriptler (koda dokunmaz)
 │   ├── 01_1d_diffusion.py          # 1D difüzyon — temel kavramlar
@@ -64,7 +70,9 @@ neo_lang/
 │   ├── 10_fluidlm_faircompare.py   # ★★ Routing izolasyonu — 48 param vs 28M MHA
 │   ├── 11_flop_and_physics.py      # FLOP analizi + öğrenilen fizik parametreleri
 │   ├── 12_ablation_alpha_pscale.py # Ablasyon: α/p_scale dondurulunca ne olur?
-│   ├── 14_industrial_compare.py   # ★★★ BPE + OpenWebText, S/M scale, multi-seed
+│   ├── 14_industrial_compare.py    # ★★★ BPE + OpenWebText, S/M scale, multi-seed
+│   ├── 14_generate.py              # Eğitilmiş checkpoint'ten metin üretimi
+│   ├── 15_nano_pilot.py            # GTX 1650 uyumlu v1 vs v2 karşılaştırma
 │   ├── compare_results.py          # Checkpoint okuyucu, karşılaştırma tablosu
 │   └── _param_breakdown.py         # Parametre dökümü (NS=64, MLP=99.5%)
 │
