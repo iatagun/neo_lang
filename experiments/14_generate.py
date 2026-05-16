@@ -437,7 +437,10 @@ def load_model(ckpt_path: str):
             mlp_ratio    = cfg.get("mlp_ratio", 4),
         )
 
-    model.load_state_dict(ckpt["model_state"])
+    # Eski checkpoint uyumu: p_scale_raw → log_p_scale
+    state = ckpt["model_state"]
+    state = {k.replace(".p_scale_raw", ".log_p_scale"): v for k, v in state.items()}
+    model.load_state_dict(state)
     model.eval().to(device)
     if USE_BF16:
         model = model.to(DTYPE)

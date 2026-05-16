@@ -49,8 +49,9 @@ parser.add_argument("--batch",     type=int,   default=8)
 parser.add_argument("--grad_accum",type=int,   default=8)
 parser.add_argument("--lr",        type=float, default=3e-4)
 parser.add_argument("--seed",      type=int,   default=42)
-parser.add_argument("--model",     default="both", choices=["fluid","gpt","both"],
-                    help="Eğitilecek model. GTX 1650 için 'fluid' önerilir")
+parser.add_argument("--model",     default="both",
+                    choices=["fluid","gpt","both","fluid_v2","v1v2","all"],
+                    help="Eğitilecek model. v1v2=fluid+fluid_v2 karşılaştırması. all=fluid+fluid_v2+gpt")
 parser.add_argument("--log_every", type=int,   default=100,  help="Her N adımda log")
 parser.add_argument("--eval_every",type=int,   default=500,  help="Her N adımda val PPL")
 parser.add_argument("--cpu",       action="store_true", help="GPU yoksa CPU kullan")
@@ -176,6 +177,20 @@ def causal_divergence(u: torch.Tensor) -> torch.Tensor:
     """div(u): mean over D dimension of gradient"""
     return causal_gradient(u).mean(dim=-1)  # [B, L]
 
+
+# ── v2 operators (O(h²) causal gradient) ─────────────────────────────────────
+
+def causal_gradient_v2(u: torch.Tensor) -> torch.Tensor:
+    """O(h²) three-point backward difference: (3u[i] - 4u[i-1] + u[i-2]) / 2"""
+    u_m1 = torch.cat([u[:, :1, :], u[:, :-1, :]], dim=1)
+    u_m2 = torch.cat([u[:, :2, :], u[:, :-2, :]], dim=1)
+    return (3.0 * u - 4.0 * u_m1 + u_m2) * 0.5
+
+
+def causal_divergence_v2(u: torch.Tensor) -> torch.Tensor:
+    """mean divergence using O(h²) gradient"""
+    return causal_gradient_v2(u).mean(dim=-1)  # [B, L]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # NS Layer (bağımsız, fluidlm/ package gerektirmez)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -234,6 +249,46 @@ class NanoFluidLayer(nn.Module):
         return x
 
 
+class NanoFluidLayerV2(NanoFluidLayer):
+    """
+    FluidLM-Nano v2 — iki iyileştirme:
+      1. O(h²) kausal gradyan  (v1: O(h¹) backward diff)
+      2. Channel mixing        (zero-init residual Linear)
+    """
+    def __init__(self, d_model: int, dropout: float = 0.0):
+        super().__init__(d_model, dropout=dropout)
+        # Zero-init: başlangıçta pasif, gradient akışıyla devreye girer
+        self.channel_mix = nn.Linear(d_model, d_model, bias=False)
+        nn.init.zeros_(self.channel_mix.weight)
+        self.channel_mix._zero_init = True   # NanoLM._init_weights tarafından ezilmez
+
+    def _rhs(self, u: torch.Tensor) -> torch.Tensor:
+        # Advection — O(h²) gradient
+        speed   = torch.tanh(u.norm(dim=-1, keepdim=True))
+        adv     = speed * causal_gradient_v2(u)
+        # Pressure — O(h²) divergence
+        div_adv = causal_divergence_v2(adv)
+        cumsum  = torch.cumsum(-div_adv, dim=1)
+        cumsum  = cumsum / (cumsum.std(dim=1, keepdim=True).detach() + 1e-6)
+        p       = cumsum / (self.alpha + 1e-6)
+        p_grad  = causal_gradient_v2(p.unsqueeze(-1)).expand_as(u)
+        p_grad  = self.p_scale_raw * p_grad
+        # Viscosity (laplacian unchanged)
+        visc    = self.nu * causal_laplacian(u)
+        return -adv - p_grad + visc
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # NS step (pre-norm, same as v1)
+        u    = self.ln1(x)
+        du   = self.dt * self._rhs(u)
+        x_ns = x + du
+        # Channel mixing — cross-embedding coupling
+        x_ns = x_ns + self.channel_mix(x_ns)
+        # MLP block
+        x    = x_ns + self.mlp(self.ln2(x_ns))
+        return x
+
+
 class NanoGPTLayer(nn.Module):
     """Standart causal MHA + MLP katmanı (FluidLM ile karşılaştırma için)"""
     def __init__(self, d_model: int, n_heads: int, seq_len: int,
@@ -273,7 +328,7 @@ class NanoLM(nn.Module):
     def __init__(self, kind: str, vocab: int, d_model: int, n_layers: int,
                  seq_len: int, dropout: float = 0.0):
         super().__init__()
-        assert kind in ("fluid", "gpt")
+        assert kind in ("fluid", "fluid_v2", "gpt")
         self.kind = kind
         n_heads   = max(1, d_model // 64)  # head_dim = 64
 
@@ -284,6 +339,10 @@ class NanoLM(nn.Module):
         if kind == "fluid":
             self.layers = nn.ModuleList([
                 NanoFluidLayer(d_model, dropout=dropout) for _ in range(n_layers)
+            ])
+        elif kind == "fluid_v2":
+            self.layers = nn.ModuleList([
+                NanoFluidLayerV2(d_model, dropout=dropout) for _ in range(n_layers)
             ])
         else:
             self.layers = nn.ModuleList([
@@ -301,6 +360,8 @@ class NanoLM(nn.Module):
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
+            if getattr(m, '_zero_init', False):
+                return   # channel_mix: zero-init korunur, üzerine yazılmaz
             nn.init.normal_(m.weight, std=0.02)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
@@ -321,7 +382,7 @@ class NanoLM(nn.Module):
 
     def physical_params(self) -> dict:
         """FluidLM için per-layer fiziksel parametre değerleri."""
-        if self.kind != "fluid":
+        if self.kind not in ("fluid", "fluid_v2"):
             return {}
         nu_vals      = [l.nu.item()            for l in self.layers]
         alpha_vals   = [l.alpha.item()         for l in self.layers]
@@ -396,14 +457,17 @@ def build_optimizer(model: NanoLM, lr: float):
 # Model oluştur
 # ─────────────────────────────────────────────────────────────────────────────
 
-RUN_FLUID = args.model in ("fluid", "both")
-RUN_GPT   = args.model in ("gpt",   "both")
+RUN_FLUID    = args.model in ("fluid", "both", "v1v2", "all")
+RUN_FLUID_V2 = args.model in ("fluid_v2", "v1v2", "all")
+RUN_GPT      = args.model in ("gpt",   "both", "all")
 
-fluid_model = NanoLM("fluid", VOCAB, args.d_model, args.n_layers, args.seq_len).to(device) if RUN_FLUID else None
-gpt_model   = NanoLM("gpt",   VOCAB, args.d_model, args.n_layers, args.seq_len).to(device) if RUN_GPT   else None
+fluid_model    = NanoLM("fluid",    VOCAB, args.d_model, args.n_layers, args.seq_len).to(device) if RUN_FLUID    else None
+fluid_v2_model = NanoLM("fluid_v2", VOCAB, args.d_model, args.n_layers, args.seq_len).to(device) if RUN_FLUID_V2 else None
+gpt_model      = NanoLM("gpt",      VOCAB, args.d_model, args.n_layers, args.seq_len).to(device) if RUN_GPT      else None
 
-if fluid_model: print(f"\n[Model] FluidLM-Nano  params={fluid_model.num_params()/1e6:.2f}M")
-if gpt_model:   print(f"[Model] GPT-Nano      params={gpt_model.num_params()/1e6:.2f}M")
+if fluid_model:    print(f"\n[Model] FluidLM-Nano v1   params={fluid_model.num_params()/1e6:.2f}M")
+if fluid_v2_model: print(f"[Model] FluidLM-Nano v2   params={fluid_v2_model.num_params()/1e6:.2f}M")
+if gpt_model:      print(f"[Model] GPT-Nano          params={gpt_model.num_params()/1e6:.2f}M")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Training setup
@@ -420,8 +484,9 @@ print(f"\n[Train] token_budget={token_budget/1e6:.0f}M  "
 print(f"[Train] tokens_per_step={tokens_per_step/1e3:.1f}K  "
       f"total_steps={total_steps:,}  warmup={warmup_steps}")
 
-fluid_opt = build_optimizer(fluid_model, args.lr) if RUN_FLUID else None
-gpt_opt   = build_optimizer(gpt_model,   args.lr) if RUN_GPT   else None
+fluid_opt    = build_optimizer(fluid_model,    args.lr) if RUN_FLUID    else None
+fluid_v2_opt = build_optimizer(fluid_v2_model, args.lr) if RUN_FLUID_V2 else None
+gpt_opt      = build_optimizer(gpt_model,      args.lr) if RUN_GPT      else None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Eğitim döngüsü
@@ -435,33 +500,35 @@ results = {
         "token_budget": token_budget, "total_steps": total_steps,
         "dtype": str(DTYPE), "seed": args.seed,
     },
-    "fluid": {"train_loss": [], "val_ppl": [], "physics": []},
-    "gpt":   {"train_loss": [], "val_ppl": []},
+    "fluid":    {"train_loss": [], "val_ppl": [], "physics": []},
+    "fluid_v2": {"train_loss": [], "val_ppl": [], "physics": []},
+    "gpt":      {"train_loss": [], "val_ppl": []},
 }
 
 print(f"\n{'='*60}")
 print(f"  Eğitim başlıyor — her iki model paralel")
 print(f"{'='*60}\n")
 
-if fluid_model: fluid_model.train()
-if gpt_model:   gpt_model.train()
+if fluid_model:    fluid_model.train()
+if fluid_v2_model: fluid_v2_model.train()
+if gpt_model:      gpt_model.train()
 
-if fluid_opt: fluid_opt.zero_grad(set_to_none=True)
-if gpt_opt:   gpt_opt.zero_grad(set_to_none=True)
+if fluid_opt:    fluid_opt.zero_grad(set_to_none=True)
+if fluid_v2_opt: fluid_v2_opt.zero_grad(set_to_none=True)
+if gpt_opt:      gpt_opt.zero_grad(set_to_none=True)
 
 t_start = time.time()
 
-fluid_acc_loss = 0.0
-gpt_acc_loss   = 0.0
+fluid_acc_loss    = 0.0
+fluid_v2_acc_loss = 0.0
+gpt_acc_loss      = 0.0
 
 for step in range(total_steps):
     lr_now = get_lr(step, warmup_steps, total_steps, args.lr, args.lr * 0.1)
-    if fluid_opt:
-        for pg in fluid_opt.param_groups:
-            pg["lr"] = lr_now * pg.get("lr_scale", 1.0)
-    if gpt_opt:
-        for pg in gpt_opt.param_groups:
-            pg["lr"] = lr_now * pg.get("lr_scale", 1.0)
+    for _opt in (fluid_opt, fluid_v2_opt, gpt_opt):
+        if _opt is not None:
+            for pg in _opt.param_groups:
+                pg["lr"] = lr_now * pg.get("lr_scale", 1.0)
 
     # Gradient accumulation
     for micro in range(args.grad_accum):
@@ -478,6 +545,18 @@ for step in range(total_steps):
             else:
                 f_loss.backward()
             fluid_acc_loss += f_loss.item()
+
+        # FluidLM v2 forward
+        if RUN_FLUID_V2:
+            with AUTOCAST:
+                fv2_logits = fluid_v2_model(x)
+                fv2_loss   = F.cross_entropy(fv2_logits.view(-1, fv2_logits.size(-1)),
+                                             y.view(-1)) / args.grad_accum
+            if scaler:
+                scaler.scale(fv2_loss).backward()
+            else:
+                fv2_loss.backward()
+            fluid_v2_acc_loss += fv2_loss.item()
 
         # GPT forward
         if RUN_GPT:
@@ -497,6 +576,10 @@ for step in range(total_steps):
             scaler.unscale_(fluid_opt)
             torch.nn.utils.clip_grad_norm_(fluid_model.parameters(), 1.0)
             scaler.step(fluid_opt)
+        if RUN_FLUID_V2:
+            scaler.unscale_(fluid_v2_opt)
+            torch.nn.utils.clip_grad_norm_(fluid_v2_model.parameters(), 1.0)
+            scaler.step(fluid_v2_opt)
         if RUN_GPT:
             scaler.unscale_(gpt_opt)
             torch.nn.utils.clip_grad_norm_(gpt_model.parameters(), 1.0)
@@ -506,12 +589,16 @@ for step in range(total_steps):
         if RUN_FLUID:
             torch.nn.utils.clip_grad_norm_(fluid_model.parameters(), 1.0)
             fluid_opt.step()
+        if RUN_FLUID_V2:
+            torch.nn.utils.clip_grad_norm_(fluid_v2_model.parameters(), 1.0)
+            fluid_v2_opt.step()
         if RUN_GPT:
             torch.nn.utils.clip_grad_norm_(gpt_model.parameters(), 1.0)
             gpt_opt.step()
 
-    if fluid_opt: fluid_opt.zero_grad(set_to_none=True)
-    if gpt_opt:   gpt_opt.zero_grad(set_to_none=True)
+    if fluid_opt:    fluid_opt.zero_grad(set_to_none=True)
+    if fluid_v2_opt: fluid_v2_opt.zero_grad(set_to_none=True)
+    if gpt_opt:      gpt_opt.zero_grad(set_to_none=True)
 
     # ── Loglama ──────────────────────────────────────────────────────────────
     if step % args.log_every == 0:
@@ -523,12 +610,17 @@ for step in range(total_steps):
         parts = [f"  step={step:5d}/{total_steps}"]
         if RUN_FLUID:
             f_ppl = math.exp(min(fluid_acc_loss / args.log_every, 20))
-            parts.append(f"fluid_ppl={f_ppl:.2f}")
+            parts.append(f"v1={f_ppl:.2f}")
             results["fluid"]["train_loss"].append({"step": step, "ppl": f_ppl})
             fluid_acc_loss = 0.0
+        if RUN_FLUID_V2:
+            fv2_ppl = math.exp(min(fluid_v2_acc_loss / args.log_every, 20))
+            parts.append(f"v2={fv2_ppl:.2f}")
+            results["fluid_v2"]["train_loss"].append({"step": step, "ppl": fv2_ppl})
+            fluid_v2_acc_loss = 0.0
         if RUN_GPT:
             g_ppl = math.exp(min(gpt_acc_loss / args.log_every, 20))
-            parts.append(f"gpt_ppl={g_ppl:.2f}")
+            parts.append(f"gpt={g_ppl:.2f}")
             results["gpt"]["train_loss"].append({"step": step, "ppl": g_ppl})
             gpt_acc_loss = 0.0
         parts += [f"lr={lr_now:.2e}", f"tok={tok_done/1e6:.1f}M",
@@ -541,23 +633,32 @@ for step in range(total_steps):
         if RUN_FLUID:
             f_val = evaluate(fluid_model)
             phys  = fluid_model.physical_params()
-            print(f"  FluidLM val_ppl = {f_val:.4f}")
+            print(f"  FluidLM v1  val_ppl = {f_val:.4f}")
             results["fluid"]["val_ppl"].append({"step": step, "ppl": f_val})
             results["fluid"]["physics"].append({"step": step, **phys})
-            print(f"\n  [Fiziksel Parametreler]")
-            print(f"    ν early(0-{max(0,args.n_layers//3-1)}) mean = {phys['nu_early_mean']:.4f}")
-            print(f"    ν late ({2*args.n_layers//3}-{args.n_layers-1}) mean  = {phys['nu_late_mean']:.4f}")
-            print(f"    ν gradient = {phys['nu_gradient']:+.4f}  "
-                  f"({'✓ oluştu' if abs(phys['nu_gradient']) > 0.002 else '— henüz küçük'})")
-            print(f"    α = {[f'{v:.3f}' for v in phys['alpha']]}")
-            print(f"    p_scale = {[f'{v:.4f}' for v in phys['p_scale']]}")
+            print(f"    ν grad={phys['nu_gradient']:+.4f}  "
+                  f"({'✓' if abs(phys['nu_gradient']) > 0.002 else '—'})")
+        if RUN_FLUID_V2:
+            fv2_val  = evaluate(fluid_v2_model)
+            phys_v2  = fluid_v2_model.physical_params()
+            print(f"  FluidLM v2  val_ppl = {fv2_val:.4f}")
+            results["fluid_v2"]["val_ppl"].append({"step": step, "ppl": fv2_val})
+            results["fluid_v2"]["physics"].append({"step": step, **phys_v2})
+            print(f"    ν grad={phys_v2['nu_gradient']:+.4f}  "
+                  f"({'✓' if abs(phys_v2['nu_gradient']) > 0.002 else '—'})")
+        if RUN_FLUID and RUN_FLUID_V2:
+            print(f"  v1 vs v2 ΔPPL = {f_val - fv2_val:+.4f}  "
+                  f"({'v2 daha iyi' if fv2_val < f_val else 'v1 daha iyi'})")
         if RUN_GPT:
             g_val = evaluate(gpt_model)
-            print(f"  GPT     val_ppl = {g_val:.4f}")
+            print(f"  GPT         val_ppl = {g_val:.4f}")
             results["gpt"]["val_ppl"].append({"step": step, "ppl": g_val})
         if RUN_FLUID and RUN_GPT:
-            print(f"  ΔPPL = {f_val - g_val:+.4f}  "
+            print(f"  v1 vs GPT ΔPPL = {f_val - g_val:+.4f}  "
                   f"({'FluidLM kazanıyor' if f_val < g_val else 'GPT kazanıyor'})")
+        if RUN_FLUID_V2 and RUN_GPT:
+            print(f"  v2 vs GPT ΔPPL = {fv2_val - g_val:+.4f}  "
+                  f"({'FluidLM v2 kazanıyor' if fv2_val < g_val else 'GPT kazanıyor'})")
         print()
 
         # JSON kaydet
@@ -573,39 +674,59 @@ print(f"\n{'='*60}")
 print(f"  SONUÇ")
 print(f"{'='*60}")
 
-f_final = evaluate(fluid_model, n_batches=100) if RUN_FLUID else None
-g_final = evaluate(gpt_model,   n_batches=100) if RUN_GPT   else None
-phys    = fluid_model.physical_params()        if RUN_FLUID else {}
+f_final   = evaluate(fluid_model,    n_batches=100) if RUN_FLUID    else None
+fv2_final = evaluate(fluid_v2_model, n_batches=100) if RUN_FLUID_V2 else None
+g_final   = evaluate(gpt_model,      n_batches=100) if RUN_GPT      else None
+phys      = fluid_model.physical_params()           if RUN_FLUID    else {}
+phys_v2   = fluid_v2_model.physical_params()        if RUN_FLUID_V2 else {}
 
-if f_final: print(f"\n  FluidLM-Nano final val_ppl = {f_final:.4f}")
-if g_final: print(f"  GPT-Nano     final val_ppl = {g_final:.4f}")
+if f_final:   print(f"\n  FluidLM-Nano v1  final val_ppl = {f_final:.4f}")
+if fv2_final: print(f"  FluidLM-Nano v2  final val_ppl = {fv2_final:.4f}")
+if g_final:   print(f"  GPT-Nano         final val_ppl = {g_final:.4f}")
+if f_final and fv2_final:
+    print(f"  v1 vs v2 ΔPPL = {f_final - fv2_final:+.4f}  "
+          f"({'v2 daha iyi ✓' if fv2_final < f_final else 'v1 daha iyi'})") 
 if f_final and g_final:
-    print(f"  ΔPPL = {f_final - g_final:+.4f}")
+    print(f"  v1 vs GPT ΔPPL = {f_final - g_final:+.4f}")
+if fv2_final and g_final:
+    print(f"  v2 vs GPT ΔPPL = {fv2_final - g_final:+.4f}")
 
-if phys:
-    print(f"\n  [Fiziksel Parametreler — Final]")
-    for i in range(args.n_layers):
+def _print_physics(label, phys, n_layers):
+    if not phys:
+        return
+    print(f"\n  [Fiziksel Parametreler — {label}]")
+    for i in range(n_layers):
         print(f"    Layer {i:2d}:  ν={phys['nu'][i]:.4f}  "
               f"α={phys['alpha'][i]:.4f}  "
               f"p_scale={phys['p_scale'][i]:.4f}  "
               f"dt={phys['dt'][i]:.4f}")
-    print(f"\n  ν gradient: {phys['nu_gradient']:+.4f}  "
+    print(f"    ν gradient: {phys['nu_gradient']:+.4f}  "
           f"({'OLUŞTU ✓' if abs(phys['nu_gradient']) > 0.002 else 'OLUŞMADI ✗'})")
 
-delta_ppl = (f_final - g_final) if (f_final and g_final) else None
-if delta_ppl is not None:
-    if delta_ppl < 0.3:   verdict = "GÜÇLÜ — FluidLM GPT'ye eşdeğer veya daha iyi"
-    elif delta_ppl < 0.7: verdict = "ORTA — FluidLM yakın ama biraz geride"
-    elif delta_ppl < 2.0: verdict = "ZAYIF — fark var ama izolasyon çalışıyor"
-    else:                 verdict = "NEGATİF — FluidLM bu scalede yetersiz"
-    print(f"\n  Yorum: {verdict}\n")
-else:
-    verdict = "tek model"
+_print_physics("v1",  phys,    args.n_layers)
+_print_physics("v2",  phys_v2, args.n_layers)
+
+def _verdict(delta):
+    if delta is None:   return "tek model"
+    if delta < 0.3:     return "GÜÇLÜ — FluidLM GPT'ye eşdeğer veya daha iyi"
+    if delta < 0.7:     return "ORTA — FluidLM yakın ama biraz geride"
+    if delta < 2.0:     return "ZAYIF — fark var ama izolasyon çalışıyor"
+    return "NEGATİF — FluidLM bu scalede yetersiz"
+
+delta_ppl    = (f_final   - g_final) if (f_final   and g_final) else None
+delta_v2_gpt = (fv2_final - g_final) if (fv2_final and g_final) else None
+verdict    = _verdict(delta_ppl)
+verdict_v2 = _verdict(delta_v2_gpt)
+
+if delta_ppl    is not None: print(f"\n  v1  Yorum: {verdict}")
+if delta_v2_gpt is not None: print(f"  v2  Yorum: {verdict_v2}\n")
 
 results["final"] = {
-    "fluid_val_ppl": f_final, "gpt_val_ppl": g_final,
-    "delta_ppl": delta_ppl, "verdict": verdict,
-    "physics_final": phys,
+    "fluid_val_ppl":    f_final,   "fluid_v2_val_ppl": fv2_final,
+    "gpt_val_ppl":      g_final,
+    "delta_ppl":        delta_ppl, "delta_v2_gpt": delta_v2_gpt,
+    "verdict":          verdict,   "verdict_v2": verdict_v2,
+    "physics_final":    phys,      "physics_v2_final": phys_v2,
 }
 Path(args.out).parent.mkdir(parents=True, exist_ok=True)
 with open(args.out, "w", encoding="utf-8") as f:

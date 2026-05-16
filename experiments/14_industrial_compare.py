@@ -262,12 +262,15 @@ class TokenStream:
                 ds = load_dataset("Skylion007/openwebtext",
                                   split="train",
                                   streaming=True)
-                # train/val ayrımı: seed=42 ile shuffle edip %99/%1
+                # train/val ayrımı: örtüşmesiz partition
+                # train: [0, 990_000), val: [990_000, ∞)
+                # shuffle AYNI seed → ayrı stream nesneleri ama aynı sıra;
+                # take/skip ile kesişmeyen dilimler garanti edilir.
                 ds = ds.shuffle(seed=42, buffer_size=10_000)
                 if split == "val":
-                    ds = ds.skip(99_000)   # yaklaşık %1 val
+                    ds = ds.skip(990_000)  # train'den sonraki kısım — overlap yok
                 else:
-                    ds = ds.take(990_000)  # yaklaşık %99 train
+                    ds = ds.take(990_000)  # [0, 990_000) — val'e girmez
                 self._stream = iter(ds)
                 self._source = "openwebtext"
                 master_print(f"[Data] OpenWebText stream hazır ({split})")
@@ -396,7 +399,7 @@ class FluidLayer(nn.Module):
         self.log_nu      = nn.Parameter(torch.tensor(math.log(nu)))
         self.log_dt      = nn.Parameter(torch.tensor(math.log(dt)))
         self.log_alpha   = nn.Parameter(torch.tensor(math.log(alpha)))
-        self.p_scale_raw = nn.Parameter(torch.tensor(1.0))   # 1.0 init: α gradyanı için yeterli sinyal
+        self.log_p_scale = nn.Parameter(torch.tensor(0.0))   # log(1.0)=0 → p_scale=1.0 at init, always positive
 
         hidden = d_model * mlp_ratio
         self.norm1 = nn.LayerNorm(d_model)
@@ -416,7 +419,7 @@ class FluidLayer(nn.Module):
     @property
     def alpha(self):   return self.log_alpha.exp()
     @property
-    def p_scale(self): return self.p_scale_raw
+    def p_scale(self): return self.log_p_scale.exp()
 
     def _rhs(self, u: torch.Tensor) -> torch.Tensor:
         speed   = torch.tanh(u.norm(dim=-1, keepdim=True))
@@ -593,36 +596,48 @@ def flops_per_token(model_type: str, d: int, L: int, T: int,
                     vocab: int, mlp_ratio: int) -> dict:
     """
     Teorik forward-pass FLOPs/token (çift sayma yok).
+    Tüm değerler token başına normalize edilir (÷T).
     Referans: Kaplan et al. 2020 "Scaling Laws" metodolojisi.
     """
     # Embedding lookup: 0 FLOP (sadece indexing)
     emb_flops = 0
 
-    # MLP sublayer: 2 × (d × hidden) × 2 = 2 matrix mult
+    # MLP sublayer: 2 linear (d→hidden, hidden→d), her biri 2×d×hidden FLOP
+    # Per-token: 2 × 2 × d × hidden
     hidden    = d * mlp_ratio
-    mlp_layer = 2 * d * hidden * 2   # forward: multiply-add
-    mlp_total = mlp_layer * L
+    mlp_per_token = 2 * 2 * d * hidden   # forward multiply-add
+    mlp_total     = mlp_per_token * L    # tüm katmanlar, per-token
 
     if model_type == "fluid":
-        # NS routing: gradient (d ops) + laplacian (2d) + FFT (L log L)
-        #             + p_grad (d) + visc (2d) + rk4 (4×) ≈ küçük
-        ns_per_layer = d * 9 + T * math.log2(max(T, 1))  # ampirik
-        routing_total = ns_per_layer * L
-        routing_label = f"NS (causal grad+FFT+RK4)"
+        # NS routing (gerçek _rhs implementasyonu):
+        #   causal_gradient:  d   multiply-add / token
+        #   causal_laplacian: 2d  multiply-add / token
+        #   norm (speed):     d   / token
+        #   advection:        d   / token
+        #   divergence:       d   mean / token
+        #   cumsum:           d   / token
+        #   p_grad:           d   / token
+        #   viscosity:        2d  / token
+        # spectral_pressure kodu _rhs'ta KULLANILMIYOR → FFT yok
+        ns_per_token = d * 9     # 9 tek boyutlu op, tümü per-token
+        routing_total = ns_per_token * L
+        routing_label = "NS (causal grad+lap+visc)"
+        routing_complexity = "O(L·T·D)"
     else:  # gpt
-        n_heads   = d // 64  # standart kural: head_dim=64
-        head_dim  = d // n_heads
-        # QKV projection: 3 × d² (per token, summed over seq → /T later)
-        qkv_flops = 3 * d * d * 2 * T   # tüm seq için
-        # Attention: Q@K^T = T*T*d, softmax≈T², attn@V = T*T*d
-        attn_flops = 2 * T * T * d
-        # Out projection: d² per token
-        out_flops  = d * d * 2 * T
-        routing_total = (qkv_flops + attn_flops + out_flops) * L
-        routing_label = "MHA (QKV+attn+proj)"
+        n_heads  = d // 64   # standart kural: head_dim=64
+        head_dim = d // n_heads
+        # QKV projection: 3 × 2×d² FLOP, per-token
+        qkv_per_token  = 3 * 2 * d * d
+        # Attention: QK^T + attn@V = 2×T×d per token (T token seq üzerinden)
+        attn_per_token = 2 * T * d
+        # Out projection: 2×d² per token
+        out_per_token  = 2 * d * d
+        routing_total  = (qkv_per_token + attn_per_token + out_per_token) * L
+        routing_label  = "MHA (QKV+attn+proj)"
+        routing_complexity = "O(L·T²·D)"
 
-    # LM head: vocab × d per token
-    head_flops = vocab * d * 2
+    # LM head: 2×vocab×d per token
+    head_flops = 2 * vocab * d
 
     total = emb_flops + mlp_total + routing_total + head_flops
     return {
@@ -631,8 +646,7 @@ def flops_per_token(model_type: str, d: int, L: int, T: int,
         "lm_head_mflop":       head_flops    / 1e6,
         "total_mflop":         total         / 1e6,
         "routing_label":       routing_label,
-        # Teorik karmaşıklık
-        "routing_complexity":  f"O(L·T²·D)" if model_type == "gpt" else f"O(L·T·log(T)·D)",
+        "routing_complexity":  routing_complexity,
     }
 
 def count_params(model: nn.Module, group_by: str = "none") -> dict:

@@ -89,7 +89,7 @@ def divergence(u: torch.Tensor, causal: bool = False) -> torch.Tensor:
 # Spectral Poisson solver
 # ─────────────────────────────────────────────────────────────────────────────
 
-def solve_poisson(rhs: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
+def solve_poisson(rhs: torch.Tensor, alpha = 1.0) -> torch.Tensor:  # alpha: float | Tensor
     """
     Solve the regularised 1-D Helmholtz–Poisson equation spectrally (FFT):
 
@@ -122,7 +122,9 @@ def solve_poisson(rhs: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
     B, L = rhs.shape
     device = rhs.device
 
-    rhs_fft = torch.fft.rfft(rhs, dim=1)                          # [B, L//2+1]
+    # bfloat16 / float16 için float32'ye yükselt: FFT bu dtype'larda hata verir
+    orig_dtype = rhs.dtype
+    rhs_fft = torch.fft.rfft(rhs.float(), dim=1)                  # [B, L//2+1]
 
     k = torch.arange(L // 2 + 1, dtype=torch.float32, device=device)
     lambda_k = 2.0 * (torch.cos(2.0 * math.pi * k / L) - 1.0) - alpha ** 2
@@ -132,5 +134,5 @@ def solve_poisson(rhs: torch.Tensor, alpha: float = 1.0) -> torch.Tensor:
 
     p_fft = rhs_fft / lambda_k.unsqueeze(0)                       # [B, L//2+1]
 
-    p = torch.fft.irfft(p_fft, n=L, dim=1)                       # [B, L]
+    p = torch.fft.irfft(p_fft, n=L, dim=1).to(orig_dtype)        # [B, L]
     return p

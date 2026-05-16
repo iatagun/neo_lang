@@ -97,6 +97,7 @@ class FluidLM(nn.Module):
         min_steps: int = 3,
         dropout: float = 0.1,
         causal: bool = True,
+        mlp_ratio: int = 4,
     ):
         super().__init__()
 
@@ -110,13 +111,12 @@ class FluidLM(nn.Module):
         self.pos_emb   = nn.Embedding(max_seq_len, d_model)
         self.emb_drop  = nn.Dropout(dropout)
 
-        # ── Navier-Stokes layers ─────────────────────────────────────────
+        # ── Navier-Stokes layers (her biri: NS sublayer + MLP sublayer) ─────
         self.layers = nn.ModuleList([
             FluidLayer(d_model, nu=nu, dt=dt, alpha=alpha, integrator=integrator,
-                       causal=causal)
+                       causal=causal, mlp_ratio=mlp_ratio, dropout=dropout)
             for _ in range(n_layers)
         ])
-
         # ── Output ───────────────────────────────────────────────────────
         self.max_seq_len = max_seq_len
         self.norm    = nn.LayerNorm(d_model)

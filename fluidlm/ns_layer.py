@@ -33,6 +33,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .fluid_ops import gradient, laplacian, divergence, solve_poisson
 
@@ -65,6 +66,8 @@ class FluidLayer(nn.Module):
         alpha: float = 1.0,
         integrator: str = "rk4",
         causal: bool = True,
+        mlp_ratio: int = 4,
+        dropout: float = 0.0,
     ):
         super().__init__()
         self.d_model    = d_model
@@ -74,7 +77,21 @@ class FluidLayer(nn.Module):
         self.log_nu      = nn.Parameter(torch.tensor(math.log(nu)))
         self.log_dt      = nn.Parameter(torch.tensor(math.log(dt)))
         self.log_alpha   = nn.Parameter(torch.tensor(math.log(alpha)))
-        self.p_scale_raw = nn.Parameter(torch.tensor(1.0))   # 1.0 init: α gradyanı için yeterli sinyal
+        self.log_p_scale = nn.Parameter(torch.tensor(0.0))  # log(1.0) → p_scale=1.0 at init
+
+        # ── Pre-norm + MLP sublayer ─────────────────────────────────
+        # norm1: NS sublayer için (routing)
+        # norm2: MLP sublayer için (kapasite / knowledge storage)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        hidden = d_model * mlp_ratio
+        self.mlp = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+            nn.Dropout(dropout),
+        )
 
     # ── convenience properties ──────────────────────────────────────────────
 
@@ -92,8 +109,8 @@ class FluidLayer(nn.Module):
 
     @property
     def p_scale(self) -> torch.Tensor:
-        """Learned scaling factor for pressure gradient contribution."""
-        return self.p_scale_raw
+        """Learned scaling factor for pressure gradient contribution (always positive)."""
+        return self.log_p_scale.exp()
 
     # ── Compressible NS right-hand side  F(u) = −(u·∇)u − ∇p + ν∇²u ────────
 
@@ -224,12 +241,24 @@ class FluidLayer(nn.Module):
         """
         dt = self.dt
 
+        # ── Sublayer 1: NS routing (pre-norm + residual) ────────────────
+        # u1 is stored once; used for integrator input, residual, and delta_ke.
+        # Calling self.norm1(u) multiple times would be redundant and — after
+        # the residual update — would evaluate on the WRONG (updated) tensor.
+        u1 = self.norm1(u)                        # [B, L, D]  pre-normed, cached
         if self.integrator == "euler":
-            u_new = self._euler(u, dt)
+            u_ns = self._euler(u1, dt)
         else:
-            u_new = self._rk4(u, dt)
+            u_ns = self._rk4(u1, dt)
+        # Residual: add only the NS delta (u_ns = u1 + dt·F(u1)  →  delta = dt·F(u1))
+        u = u + (u_ns - u1)
 
-        # Normalised ΔKE: relative change (scale-invariant convergence criterion)
-        # delta_ke ≈ ||u_new - u||² / (||u||² + ε)
-        delta_ke = (u_new - u).pow(2).mean() / (u.pow(2).mean() + 1e-6)
-        return u_new, delta_ke
+        # ── ΔKE — measure NS routing change BEFORE MLP (convergence criterion) ──
+        # Ratio of NS force magnitude to current state magnitude.
+        # Small delta_ke → physics has converged → adaptive mode can stop.
+        delta_ke = (u_ns - u1).pow(2).mean() / (u1.pow(2).mean() + 1e-6)
+
+        # ── Sublayer 2: MLP (pre-norm + residual) ─────────────────────
+        u = u + self.mlp(self.norm2(u))
+
+        return u, delta_ke
