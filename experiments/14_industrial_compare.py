@@ -387,7 +387,7 @@ def spectral_pressure(adv: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
 class FluidLayer(nn.Module):
     """
     1 katman NS timestep + MLP sublayer.
-    Routing parametreleri: log_nu, log_dt, log_alpha, log_p_scale (4 skaler).
+    Routing parametreleri: log_nu, log_dt, log_alpha, p_scale_raw (4 skaler).
     MLP parametreleri: d_model → hidden → d_model (asıl kapasite).
     """
     def __init__(self, d_model: int, nu: float = 0.01, dt: float = 0.05,
@@ -396,7 +396,7 @@ class FluidLayer(nn.Module):
         self.log_nu      = nn.Parameter(torch.tensor(math.log(nu)))
         self.log_dt      = nn.Parameter(torch.tensor(math.log(dt)))
         self.log_alpha   = nn.Parameter(torch.tensor(math.log(alpha)))
-        self.log_p_scale = nn.Parameter(torch.tensor(math.log(0.1)))
+        self.p_scale_raw = nn.Parameter(torch.tensor(1.0))   # 1.0 init: α gradyanı için yeterli sinyal
 
         hidden = d_model * mlp_ratio
         self.norm1 = nn.LayerNorm(d_model)
@@ -416,14 +416,19 @@ class FluidLayer(nn.Module):
     @property
     def alpha(self):   return self.log_alpha.exp()
     @property
-    def p_scale(self): return self.log_p_scale.exp()
+    def p_scale(self): return self.p_scale_raw
 
     def _rhs(self, u: torch.Tensor) -> torch.Tensor:
-        speed  = torch.tanh(u.norm(dim=-1, keepdim=True))
-        adv    = speed * causal_gradient(u)
-        p      = spectral_pressure(adv, self.alpha)
-        p_grad = self.p_scale * causal_gradient(p.unsqueeze(-1)).expand_as(u)
-        visc   = self.nu * causal_laplacian(u)
+        speed   = torch.tanh(u.norm(dim=-1, keepdim=True))
+        adv     = speed * causal_gradient(u)
+        # Causal cumsum: normalise BEFORE dividing by alpha so that alpha is NOT
+        # cancelled by std(cumsum/alpha) = std(cumsum)/alpha.
+        div_adv = causal_divergence(adv)
+        cumsum  = torch.cumsum(-div_adv, dim=1)
+        cumsum  = cumsum / (cumsum.std(dim=1, keepdim=True).detach() + 1e-6)  # normalise first
+        p       = cumsum / (self.alpha + 1e-6)                                # alpha in gradient path
+        p_grad  = self.p_scale * causal_gradient(p.unsqueeze(-1)).expand_as(u)
+        visc    = self.nu * causal_laplacian(u)
         return -adv - p_grad + visc
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
@@ -643,7 +648,7 @@ def count_params(model: nn.Module, group_by: str = "none") -> dict:
                 if ".mlp." in n)
     # Routing (FluidLM: log_nu/dt/alpha/p_scale; GPT: qkv+proj)
     routing = sum(p.numel() for n, p in model.named_parameters()
-                  if any(x in n for x in ["log_nu","log_dt","log_alpha","log_p_scale",
+                  if any(x in n for x in ["log_nu","log_dt","log_alpha","p_scale_raw",
                                            ".qkv.",".attn.",".proj."]))
     norm  = sum(p.numel() for n, p in model.named_parameters() if "norm" in n)
 
@@ -1351,8 +1356,10 @@ def main():
 
     for scale in scales_to_run:
         sc = SCALE_CONFIGS[scale]
-        for model_type in models_to_run:
-            for seed in seeds_for(scale):
+        # Interleaved sıra: fluid_s42, gpt_s42, fluid_s43, gpt_s43, ...
+        # Böylece her seed çifti ardışık eğitilir; erken karşılaştırma mümkün olur.
+        for seed in seeds_for(scale):
+            for model_type in models_to_run:
                 run_id_check = f"14_{model_type}_{sc.name}_s{seed}"
                 if run_id_check in completed_ids:
                     master_print(f"  [Skip] {run_id_check} zaten tamamlandı.")

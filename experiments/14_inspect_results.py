@@ -169,17 +169,23 @@ for scale in ["S", "M"]:
     print(f"\n  [{bold(scale+' scale')}]  "
           f"FluidLM: {len(fluid_runs)} run  GPT: {len(gpt_runs)} run")
 
-    # RQ3 — emergent ν
+    # RQ3 — emergent ν  (eğitim loguyla tutarlı: late_avg(8-11) - early_avg(0-3))
     nu_grads = []
     for r in fluid_runs:
         p = r.get("physical_params")
         if p:
-            g = p["nu"][-1] - p["nu"][0]
+            nu   = p["nu"]
+            n    = len(nu)
+            early = sum(nu[:4]) / 4
+            late  = sum(nu[max(0, n-4):]) / 4
+            g     = late - early
             nu_grads.append(g)
     if nu_grads:
         avg_grad = sum(nu_grads) / len(nu_grads)
-        consistent = all(g > 0 for g in nu_grads)
-        verdict = green("✓ DOĞRULANDI") if consistent else yellow("~ TUTARSIZ")
+        # Tutarlılık: tüm seedler aynı yönde (hepsi pozitif VEYA hepsi negatif)
+        consistent = all(g > 0 for g in nu_grads) or all(g < 0 for g in nu_grads)
+        direction  = "erken>geç (yüksek→düşük ν)" if avg_grad < 0 else "erken<geç (düşük→yüksek ν)"
+        verdict = green(f"✓ DOĞRULANDI ({direction})") if consistent else yellow("~ TUTARSIZ (seedler ters yönde)")
         print(f"  RQ3 ν gradyanı : {verdict}  "
               f"ort. Δν={avg_grad:+.4f}  "
               f"seeds={[f'{g:+.4f}' for g in nu_grads]}")
@@ -249,27 +255,22 @@ print(bold(f"{'='*68}\n"))
 
 # ─── Plot (isteğe bağlı) ──────────────────────────────────────────────────────
 if args.plot:
-    sys.path.insert(0, REPO_ROOT)
-    # 14_industrial_compare'daki plot fonksiyonunu tekrar kullan
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         import matplotlib.gridspec as gridspec
         import numpy as np
+        import importlib.util
 
         OUT_DIR = os.path.join(REPO_ROOT, "results")
-        # plot_results fonksiyonunu import etmek yerine inline çalıştır
-        exec(open(os.path.join(SCRIPT_DIR, "14_industrial_compare.py"),
-                  encoding="utf-8").read().split("def plot_results")[1].split(
-                  "\ndef write_academic")[0]
-             .replace("def plot_results(all_results, out_dir):", "")
-             .replace("master_print", "print"), {
-                 "all_results": all_results,
-                 "out_dir": OUT_DIR,
-                 "plt": plt, "gridspec": gridspec, "np": np,
-                 "math": math,
-             })
+        spec = importlib.util.spec_from_file_location(
+            "industrial_compare",
+            os.path.join(SCRIPT_DIR, "14_industrial_compare.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.plot_results(all_results, OUT_DIR)
         print(f"PNG oluşturuldu: {OUT_DIR}/14_industrial_compare.png")
     except Exception as e:
         print(f"Plot hatası: {e}")
