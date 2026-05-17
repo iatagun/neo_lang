@@ -401,6 +401,14 @@ class FluidLayer(nn.Module):
         self.log_alpha   = nn.Parameter(torch.tensor(math.log(alpha)))
         self.log_p_scale = nn.Parameter(torch.tensor(0.0))   # log(1.0)=0 → p_scale=1.0 at init, always positive
 
+        # v4: content-dependent advection speed
+        # speed_i = tanh(q_i · k_{i-1} / sqrt(d_k))  [causal, O(L)]
+        self._d_k = max(d_model // 8, 16)
+        self.W_q = nn.Linear(d_model, self._d_k, bias=False)
+        self.W_k = nn.Linear(d_model, self._d_k, bias=False)
+        nn.init.normal_(self.W_q.weight, std=0.02)
+        nn.init.normal_(self.W_k.weight, std=0.02)
+
         hidden = d_model * mlp_ratio
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -422,7 +430,11 @@ class FluidLayer(nn.Module):
     def p_scale(self): return self.log_p_scale.exp()
 
     def _rhs(self, u: torch.Tensor) -> torch.Tensor:
-        speed   = torch.tanh(u.norm(dim=-1, keepdim=True))
+        # v4: content-dependent speed — token i's rate depends on prev token's key
+        q      = self.W_q(u)                                               # [B, L, d_k]
+        k      = self.W_k(u)                                               # [B, L, d_k]
+        k_prev = torch.cat([torch.zeros_like(k[:, :1]), k[:, :-1]], dim=1) # causal shift
+        speed  = torch.tanh((q * k_prev).sum(-1, keepdim=True) / (self._d_k ** 0.5))
         adv     = speed * causal_gradient(u)
         # Causal cumsum: normalise BEFORE dividing by alpha so that alpha is NOT
         # cancelled by std(cumsum/alpha) = std(cumsum)/alpha.
@@ -609,19 +621,21 @@ def flops_per_token(model_type: str, d: int, L: int, T: int,
     mlp_total     = mlp_per_token * L    # tüm katmanlar, per-token
 
     if model_type == "fluid":
-        # NS routing (gerçek _rhs implementasyonu):
-        #   causal_gradient:  d   multiply-add / token
-        #   causal_laplacian: 2d  multiply-add / token
-        #   norm (speed):     d   / token
-        #   advection:        d   / token
-        #   divergence:       d   mean / token
-        #   cumsum:           d   / token
-        #   p_grad:           d   / token
-        #   viscosity:        2d  / token
-        # spectral_pressure kodu _rhs'ta KULLANILMIYOR → FFT yok
-        ns_per_token = d * 9     # 9 tek boyutlu op, tümü per-token
+        # NS routing (v4: content-dependent speed):
+        #   W_q, W_k projections: 2 × 2×d×d_k FLOP per token
+        #   dot-product speed:    d_k mul+sum   per token
+        #   causal_gradient:      d             per token
+        #   causal_laplacian:     2d            per token
+        #   advection:            d             per token
+        #   divergence:           d             per token
+        #   cumsum:               d             per token
+        #   p_grad:               d             per token
+        #   viscosity:            2d            per token
+        d_k = max(d // 8, 16)
+        wqk_per_token = 2 * 2 * d * d_k   # W_q + W_k projections
+        ns_per_token  = wqk_per_token + d_k + d * 9
         routing_total = ns_per_token * L
-        routing_label = "NS (causal grad+lap+visc)"
+        routing_label = "NS v4 (content-dep speed)"
         routing_complexity = "O(L·T·D)"
     else:  # gpt
         n_heads  = d // 64   # standart kural: head_dim=64
