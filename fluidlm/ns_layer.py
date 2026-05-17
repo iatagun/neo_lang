@@ -82,6 +82,16 @@ class FluidLayer(nn.Module):
         # ── Pre-norm + MLP sublayer ─────────────────────────────────
         # norm1: NS sublayer için (routing)
         # norm2: MLP sublayer için (kapasite / knowledge storage)
+        # Content-dependent advection speed (v4 fix)
+        # speed_i = tanh(q_i · k_{i-1} / sqrt(d_k))  [causal, O(L)]
+        # Replaces content-independent speed = tanh(||u||) which caused
+        # token routing to be independent of neighbouring token content.
+        self._d_k = max(d_model // 8, 16)
+        self.W_q = nn.Linear(d_model, self._d_k, bias=False)
+        self.W_k = nn.Linear(d_model, self._d_k, bias=False)
+        nn.init.normal_(self.W_q.weight, std=0.02)
+        nn.init.normal_(self.W_k.weight, std=0.02)
+
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         hidden = d_model * mlp_ratio
@@ -167,7 +177,12 @@ class FluidLayer(nn.Module):
         Diffuses sharp embedding differences between neighbouring tokens.
         """
         # 1. Advection ─────────────────────────────────────────────────────
-        speed = torch.tanh(u.norm(dim=-1, keepdim=True))         # [B, L, 1]
+        # Content-dependent speed: token i's transport rate depends on
+        # its query matching the previous token's key (causal, O(L)).
+        q = self.W_q(u)                                               # [B, L, d_k]
+        k = self.W_k(u)                                               # [B, L, d_k]
+        k_prev = torch.cat([torch.zeros_like(k[:, :1]), k[:, :-1]], dim=1)  # causal shift
+        speed = torch.tanh((q * k_prev).sum(-1, keepdim=True) / (self._d_k ** 0.5))  # [B, L, 1]
         adv   = speed * gradient(u, causal=self.causal)          # [B, L, D]
 
         # 2. Pressure (long-range coupling) ────────────────────────────────
