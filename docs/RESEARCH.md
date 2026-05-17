@@ -199,6 +199,36 @@ GPT-S     = MHA routing + paylaşılan MLP + aynı veri + aynı token budget
 - NS routing ile MHA routing PPL farkı < 1.0 (tam karşılaştırma Exp 14'te)
 - 48 parametre ile 28.3M parametre arasındaki fark PPL'e yansımıyor
 
+### Exp 15 — Nano Pilot: İçerik Bağımlı Hız Ablasyonu (Tamamlandı)
+
+**Arka plan:** Exp 14, FluidLM-S'nin GPT-S'ye ~30 PPL bakımından geride kaldığını gösterdi.  
+Kök neden analizi: `speed = tanh(‖u‖)` içerik-bağımsız routing — MHA'nın `score(i,j) = ⟨q_i, k_j⟩` dinamizmini barındırmıyor.
+
+**V4 Deneşi:** `speed_i = tanh(q_i · k_{i-1} / √d_k)` ile nano-ölçekte ablasyon (d=256, L=6, seq=128).
+
+| Model                | Val PPL @ step 200 | ΔPPL vs GPT |
+|---------------------|--------------------|--------------|
+| Fluid v1 (baseline) | ~1,214             | +324         |
+| Fluid v2            | ~1,100+            | +210+        |
+| Fluid v3 (per-ch.)  | ~1,050+            | +160+        |
+| **Fluid v4 (içerik)** | **882.1**        | **−8.4** ✅   |
+| GPT (MHA)           | 890.5              | —           |
+
+> **İlk kez: FluidLM, GPT'yi geçti.** ΔPPL = −8.4 @ step 200.  
+> v1'de `speed = tanh(‖u‖)` ile ΔPPL = +324 idi. V4 ile fark 332 PPL kapandı.
+
+**V4 mekanizması:**
+```python
+q = W_q(u)                                          # [B, L, d_k]
+k = W_k(u)                                          # [B, L, d_k]
+k_prev = cat([zeros_like(k[:,:1]), k[:,:-1]], dim=1) # causal shift
+speed  = tanh((q * k_prev).sum(-1, keepdim=True) / d_k**0.5)  # [B, L, 1]
+```
+
+**Parametre maliyeti:** `d_k = d_model // 8` → L=6 için 6 × 2 × (d × d_k) = minik ek yük.  
+
+**Commit:** `6a27f5b` — `fluidlm/ns_layer.py` üretim paketine portlandi.
+
 ### Exp 14 — Industrial Scale (Devam Ediyor)
 
 **FluidLM-S sonuçlar:**
@@ -270,13 +300,32 @@ GPT-S     s42 (ara):    48.8288 PPL  @ step 2000  →  ~38 PPL tahmin final
 Tahmini ΔPPL ≈ 30+  →  tablonun dışında, ❌ kesin olumsuz
 ```
 
-> Bu fark, NS routing'in içerik-bağımsız yapısından kaynaklanıyor:  
+> **Güncel Durum (v4 sonrası, 17 Mayıs 2026):**  
+> `fluidlm/ns_layer.py` içerik bağımlı hıza (v4) güncellendi — commit `6a27f5b`.  
+> Nano-pilot v4, GPT'yi step 200'de ΔPPL=−8.4 ile geçti (ilk FluidLM zaferı).  
+> Exp 14'te bu düzeltmenin S-ölçekte PPL açığını ne kadar kapayacağı henüz bilinmiyor; yeniden eğitim gerekiyor.
+> 
+> **Eski analiz (v1 routing için):**  
+> Bu fark, NS routing'in içerik-bağımsız yapısından kaynaklanıyordu:  
 > MHA her forward'da `score(i,j) = ⟨q_i, k_j⟩` hesaplar (token çiftleri dinamik).  
-> NS routing ise `speed = tanh(‖u‖)` kullanır — token j, token i'yi hiç görmez.
+> V1 NS routing `speed = tanh(‖u‖)` kullanıyordu — token j, token i'yi hiç görmez.  
+> **V4 bu sorunu düzeltir:** `speed_i = tanh(q_i · k_{i-1} / √d_k)` ile içerik-dinamik routing.
 
 ---
 
 ## 7. Açık Sorular
+
+### S5 — V4 Düzeltmesi S-Ölçekte ΔPPL'i Kapatıyor mu?
+
+Nano-pilot (d=256, L=6) üzerninde v4, GPT'yi ΔPPL=−8.4 ile geçti.  
+S-ölçekte (d=768, L=12) bu iyileştirmenin ~30 PPL açığı üzerine etkisi belirsiz.
+
+**Hipotezler:**
+1. V4, S-ölçekte de anlamlı iyileştirme sağlar (ama full gap kapanmayabilir)
+2. S-ölçekte daha zengin tokenönü bağlam → `k_{i-1}` tek adım yeterli değil
+3. Wider attention window (k_{i-2}, k_{i-3}) eklenmesi gerekiyor
+
+**Sonraki adım:** `14_industrial_compare.py` v4 routing ile yeniden eğit (commit `6a27f5b` ile mevcut).
 
 ### S1 — α ve p_scale Neden Öğrenmiyor?
 
@@ -321,9 +370,13 @@ Bu dağılım ν ile korelasyonlu mu?
 ### Kısa Vade (Exp 14 tamamlanınca)
 
 - [x] FluidLM-S seed 42 eğit → **68.9726 PPL** ✅ (6102/6103, t=372m)
+- [x] İçerik-bağımsız routing sorununu teşhis et (Exp 15 nano-pilot ablasyonu)
+- [x] V4 içerik-bağımlı hız: `NanoFluidLayerV4` implement et, nano'da ΔPPL=−8.4 doğrula ✅
+- [x] `fluidlm/ns_layer.py` üretim paketine v4 portla, commit `6a27f5b` ✅
 - [ ] GPT-S seed 42 eğit (🔄 %33, ara: 48.83 @ step 2000)
 - [ ] GPT-S seed 43/44 eğit
-- [ ] ΔPPL hesapla, RQ1 karara bağla (tahmini sonuç: ~30+ → ❌ olumsuz)
+- [ ] ΔPPL hesapla, RQ1 karara bağla
+- [ ] **Exp 14'i v4 routing ile yeniden çalıştır** (commit `6a27f5b` ile güncel — S-ölçekte etki ölç)
 - [ ] FluidLM-S seed 43/44 eğit
 - [ ] WikiText-103 zero-shot eval
 - [ ] FluidLM-M + GPT-M (seed 42)

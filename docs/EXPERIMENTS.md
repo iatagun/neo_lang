@@ -7,8 +7,8 @@
 ## Deney Sıralaması
 
 ```
-01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11 → 12 → 13 → 14
-teori  NS  toy  üretim  şakespeare  büyük  char-135M  950M  GPT-base  izolasyon  FLOP  ablasyon  3D-viz  industrial
+01 → 02 → 03 → 04 → 05 → 06 → 07 → 08 → 09 → 10 → 11 → 12 → 13 → 14 → 15
+teori  NS  toy  üretim  şakespeare  büyük  char-135M  950M  GPT-base  izolasyon  FLOP  ablasyon  3D-viz  industrial  nano-ablasyon
 ```
 
 ---
@@ -288,21 +288,71 @@ Warmup adımı     : 100 (cosine lr schedule)
 
 ### Checkpoint Durumu (Mayıs 2026)
 
-| Run ID              | PPL       | Step  | Durum  |
-|---------------------|-----------|-------|--------|
-| fluid_S_s42_best.pt | **73.65** | 5,000 | ✅ tam  |
-| fluid_S_s43_best.pt | **84.79** | 4,000 | ✅ tam  |
-| fluid_S_s44_best.pt | —         | ?     | 🔄 devam |
-| gpt_S_s42_best.pt   | —         | —     | ⏳ bekliyor |
-| gpt_S_s43_best.pt   | —         | —     | ⏳ bekliyor |
-| gpt_S_s44_best.pt   | —         | —     | ⏳ bekliyor |
-| fluid_M_s42_best.pt | —         | —     | ⏳ bekliyor |
-| gpt_M_s42_best.pt   | —         | —     | ⏳ bekliyor |
+| Run ID               | PPL       | Step  | Durum  |
+|----------------------|-----------|-------|--------|
+| fluid_S_s42_best2.pt | **68.97** | 6,102 | ✅ tam (v1 routing) |
+| fluid_S_s43_best.pt  | **84.79** | 4,000 | 🔄 ara   |
+| fluid_S_s44_best.pt  | —         | ?     | ⏳ bekliyor |
+| gpt_S_s42_best.pt    | —         | —     | ⏳ bekliyor |
+| gpt_S_s43_best.pt    | —         | —     | ⏳ bekliyor |
+| gpt_S_s44_best.pt    | —         | —     | ⏳ bekliyor |
+| fluid_M_s42_best.pt  | —         | —     | ⏳ bekliyor |
+| gpt_M_s42_best.pt    | —         | —     | ⏳ bekliyor |
 
-> **Not:** step=4,000/5,000 değerleri ara kontrol noktalarıdır; tam eğitim step=6,103'te biter.  
-> PPL değerleri tamamlandığında düşebilir.
+> **Not:** `fluid_S_s42_best2.pt` = tam eğitim sonuç (6102/6103 adım, v1 routing).  
+> V4 routing commit `6a27f5b` ile merge edildi; yeniden eğitim planlaniyor (bkz. Exp 15).
+
+---
+
+## 15 — Nano Pilot: İçerik Bağımlı Hız Ablasyonu (★★★)
+
+**Script:** `experiments/15_nano_pilot.py`  
+**Durum:** ✅ V4 tamamlandı, commit `f279520` + `6a27f5b`
+
+### Motivasyon
+
+Exp 14, FluidLM-S'nin GPT-S'ye ~30 PPL bakımından geride kaldığını gösterdi.  
+Kok neden: `speed = tanh(‖u‖)` — token routing içerik-bağımsız, MHA'nın dinamik `score(i,j)` mekanizması yok.
+
+Nano-pilot (d=256, L=6, seq=128), dört routing stratejisini karstılık gösterdi:
+
+| Model                | Val PPL @ step 200 | ΔPPL vs GPT |
+|---------------------|--------------------|--------------|
+| Fluid v1 (norm hız) | ~1,214             | +324         |
+| Fluid v2            | ~1,100+            | +210+        |
+| Fluid v3 (per-ch.)  | ~1,050+            | +160+        |
+| **Fluid v4 (içerik)** | **882.1**        | **−8.4** ✅   |
+| GPT (MHA)           | 890.5              | —           |
+
+### V4 Mekanizması
+
+```python
+# d_k = d_model // 8 (nano: 32, S-ölçek: 96)
+q     = W_q(u)                                         # [B, L, d_k]
+k     = W_k(u)                                         # [B, L, d_k]
+k_prev = cat([zeros_like(k[:,:1]), k[:,:-1]], dim=1)    # causal shift
+speed  = tanh((q * k_prev).sum(-1, keepdim=True) / d_k**0.5)  # [B, L, 1]
+adv    = speed * gradient(u, causal=True)               # [B, L, D]
+```
+
+**Fiziksel yorum:** Token i'nin taşıma hızı, bir önceki tokenin bağlamına göre dinamik belirlenir.  
+Bu, Reynolds sayısının içerik gated versiyonudur (gerçek türbülansı kapsayan biçim).
 
 ### Komutlar
+
+```bash
+# V4 karstılıklı tüm modeller (v1/v2/v3/v4 + GPT)
+python experiments/15_nano_pilot.py --model all --tokens 20e6 --log_every 50 --eval_every 200
+
+# Sadece v4 uzun koşu
+python experiments/15_nano_pilot.py --model fluid_v4 --tokens 20e6
+```
+
+### Sonraki Adım
+
+`fluidlm/ns_layer.py` üretim paketine portlandi (commit `6a27f5b`).  
+S-ölçekte Exp 14 yeniden çalıştırılarak ΔPPL etkisi ölçülmesi planlanıyor.
+
 
 ```bash
 # FluidLM-S (tüm seedler, resume destekli)

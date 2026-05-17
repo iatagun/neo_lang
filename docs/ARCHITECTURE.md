@@ -105,15 +105,27 @@ Input token IDs  [B, L]
 
 Her `FluidLayer`, şu hesabı yapar:
 
-### 3.1 Adveksiyon
+### 3.1 Adveksiyon (v4 — İçerik Bağımlı Hız)
 
 ```
-speed[b,i]  = tanh(‖u[b,i,:]‖₂)        # [B, L, 1] — Reynolds sınırlayıcı
+# Projeksiyon (öğrenilen, d_k = d_model // 8)
+q[b,i]      = W_q · u[b,i]              # [B, L, d_k]
+k[b,i]      = W_k · u[b,i]              # [B, L, d_k]
+
+# Causal dot-product: token i'nin hızı, i-1'inci tokenin içeriğine bağlı
+speed[b,i]  = tanh( (q[b,i] · k[b,i-1]) / √d_k )   # [B, L, 1]
+
 grad_u[b,i] = ∂u/∂x[b,i]               # [B, L, D] — yerel gradyan
 adv[b,i]    = speed[b,i] · grad_u[b,i]  # [B, L, D] — taşınan değişim
 ```
 
-`tanh(‖u‖)` ile normun `(0, 1)` aralığında tutulması kritik — aksi hâlde embedding değerleri katmanlar boyunca patlayabilir (laminar → turbulent geçiş engellenir).
+**Neden içerik bağımlı?**  
+Eski `speed = tanh(‖u‖)` yalnızca token i'nin kendi normuna bakıyordu — komşu tokenları hiç görmüyordu.  
+V4 ile `speed_i = tanh(q_i · k_{i-1} / √d_k)`: token i'nin taşıma hızı, önceki tokenin içeriğine göre dinamik biçimde ayarlanır. Bu, attention'ın `score(i,j) = ⟨W_Q·uᵢ, W_K·uⱼ⟩` etkileşimini O(L) maliyetle yaklaşık olarak modellemektedir.  
+
+> **Fiziksel yorum:** `speed_i`, Reynolds sayısının içerik gated versiyonu — akış hızı, yukarı akışın bağlamına göre değişir (gerçek türbülansta da bu böyledir).  
+
+`tanh(·)` ile hız `(−1, 1)` aralığında kalır — geri akış (negatif hız) teorik olarak mümkündür; bu, bağlama göre "geri dönüp bak" davranışını sağlar.
 
 ### 3.2 Basınç (Causal Mod)
 
