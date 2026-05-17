@@ -288,16 +288,17 @@ Warmup adımı     : 100 (cosine lr schedule)
 
 ### Checkpoint Durumu (Mayıs 2026)
 
-| Run ID               | PPL       | Step  | Durum  |
-|----------------------|-----------|-------|--------|
-| fluid_S_s42_best2.pt | **68.97** | 6,102 | ✅ tam (v1 routing) |
-| fluid_S_s43_best.pt  | **84.79** | 4,000 | 🔄 ara   |
-| fluid_S_s44_best.pt  | —         | ?     | ⏳ bekliyor |
-| gpt_S_s42_best.pt    | —         | —     | ⏳ bekliyor |
-| gpt_S_s43_best.pt    | —         | —     | ⏳ bekliyor |
-| gpt_S_s44_best.pt    | —         | —     | ⏳ bekliyor |
-| fluid_M_s42_best.pt  | —         | —     | ⏳ bekliyor |
-| gpt_M_s42_best.pt    | —         | —     | ⏳ bekliyor |
+| Run ID               | Routing | Budget | PPL (best)  | Step  | Durum  |
+|----------------------|---------|--------|-------------|-------|--------|
+| fluid_S_s42_best2.pt | v1      | 3B     | **68.97**   | 6,102 | ✅ tam |
+| fluid_S_s42 (v4)     | **v4**  | **1B** | **107.19**  | 2,000 | ✅ tam |
+| fluid_S_s43_best.pt  | v1      | —      | **84.79**   | 4,000 | 🔄 ara |
+| fluid_S_s44_best.pt  | —       | —      | —           | ?     | ⏳ bekliyor |
+| gpt_S_s42            | MHA     | **1B** | —           | 0     | 🔄 yeni başladı |
+| gpt_S_s43_best.pt    | —       | —      | —           | —     | ⏳ bekliyor |
+| gpt_S_s44_best.pt    | —       | —      | —           | —     | ⏳ bekliyor |
+| fluid_M_s42_best.pt  | —       | —      | —           | —     | ⏳ bekliyor |
+| gpt_M_s42_best.pt    | —       | —      | —           | —     | ⏳ bekliyor |
 
 > **Not:** `fluid_S_s42_best2.pt` = tam eğitim sonuç (6102/6103 adım, v1 routing).  
 > V4 routing commit `6a27f5b` ile merge edildi; yeniden eğitim planlaniyor (bkz. Exp 15).

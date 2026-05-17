@@ -233,39 +233,47 @@ speed  = tanh((q * k_prev).sum(-1, keepdim=True) / d_k**0.5)  # [B, L, 1]
 
 **FluidLM-S sonuçlar:**
 
-| Seed | Val PPL (final) | Step        | Durum        |
-|------|-----------------|-------------|-------------|
-| 42   | **68.9726**     | 6,102/6,103 | ✅ **TAMAMLANDI** |
-| 43   | —               | —           | 🔄 beklemede |
-| 44   | —               | —           | 🔄 beklemede |
+| Seed | Routing | Token Budget | Val PPL (best) | Step        | Durum        |
+|------|---------|-------------|----------------|-------------|-------------|
+| 42   | v1      | 3B          | **68.9726**    | 6,102/6,103 | ✅ **TAMAMLANDI** |
+| 42   | **v4**  | **1B**      | **107.1919**   | 2,000/2,034 | ✅ **TAMAMLANDI** |
+| 43   | —       | —           | —              | —           | 🔄 beklemede |
+| 44   | —       | —           | —              | —           | 🔄 beklemede |
 
-**GPT-S sonuçlar (seed 42, devam ediyor):**
+**GPT-S sonuçlar:**
 
-| Seed | Val PPL (ara) | Step        | Durum      |
-|------|---------------|-------------|------------|
-| 42   | **48.8288**   | 2,000/6,103 | 🔄 %33 (t=91m) |
-| 43   | —             | —           | 🔄 beklemede |
-| 44   | —             | —           | 🔄 beklemede |
+| Seed | Token Budget | Val PPL (ara) | Step    | Durum      |
+|------|-------------|---------------|---------|------------|
+| 42   | **1B**      | 58,074 (başl.) | 0/2,034 | 🔄 yeni başladı |
+| 43   | —           | —             | —       | ⏳ bekliyor |
+| 44   | —           | —             | —       | ⏳ bekliyor |
 
-> **Not:** GPT-S seed 42, step=2000'de 48.83 PPL ile FluidLM'nin final PPL'ini (68.97) çoktan geçti.  
-> Eğitim tamamlandığında (~6100. adım) GPT-S'nin **~35–42 PPL** bandında biteceği tahmin ediliyor.  
-> Tahmini `ΔPPL ≈ 68.97 − ~38 ≈ ~30` — null hipotez (`|ΔPPL| < 0.5`) **kesin olarak reddedildi.**
+> **Not:** V4 routing ile 1B token kıyaslama koşusu: GPT-S s42 tamamlandığında FluidLM-S v4 @ 1B ile doğrudan karşılaştırılacak. ΔPPL yönü (positif mi negatif mi) kritik — nano-pilot v4, ΔPPL=−8.4 ile GPT'yi geçmişti.
 
-**Öğrenilen fizik (Exp 14):**
+**Öğrenilen fizik — V4 routing öncesi vs sonrası (Exp 14, seed 42):**
+
+| Parametre        | V1 routing (3B) | **V4 routing (1B)** | Değişim        |
+|-----------------|-----------------|---------------------|---------------|
+| ν gradient      | +0.0099         | **+0.1936**         | **×19.6×** 🟢 |
+| ν early (0-3)   | ~0.016          | **0.1606**          | +10×          |
+| ν late (8-11)   | ~0.026          | **0.2542**          | +10×          |
+| ν range         | [0.012, 0.031]  | **[0.0541, 0.2698]**| çok daha geniş |
+
+> **Önemli bulgu:** V4 içerik-bağımlı hız, NU gradyanını ~20 kat artırdı. V1'de `ν` başlangıç değerinde neredeyse takılı kalıyordu; v4 ile katman boyunca **0.05 → 0.27** geniş bir spektrum öğreniyor.  
+> Bu, RQ3 ("ν gradyanı monoton artar mı?") için çok daha güçlü bir doğrulama.  
+
+**V4 @ 1B PPL eğrisi:**
 
 ```
-seed 42:
-  ν:  [0.0159, 0.0255, 0.0258, 0.0258]  (başlangıç→son, +0.0099 gradient)
-  dt: [0.1094, 0.0613, 0.0469, 0.0940]  (U-şekli profil devam ediyor)
-  α:  [1.0, 1.0, ..., 1.0]              ← öğrenme yok
-  p_scale: [0.1, 0.1, ..., 0.1]         ← öğrenme yok
-
-seed 43:
-  ν:  [0.0152, 0.0236, 0.0240]  (+0.0088 gradient)
-  dt:  U-şekli devam ediyor
+step=    0  val_ppl=59,750  (başlangıç chaos)
+step=  500  val_ppl=  204.9
+step= 1000  val_ppl=  141.5
+step= 1500  val_ppl=  114.2
+step= 2000  val_ppl=  107.2  ← en iyi
+step= 2033  val_ppl=  111.0  (final)
 ```
 
-**α ve p_scale öğrenemedi** — bu açık bir araştırma sorusudur (bkz. §7).
+> GPT-S s42 @ 1B tamamlandığında karşılaştırma güncellenmeli.
 
 ### Enerji Analizi (Teorik, Exp 14)
 
@@ -292,13 +300,20 @@ GPT-S sonuçları tamamlandığında `ΔPPL = |FluidLM_medyan − GPT_medyan|`:
 | 0.7 – 2.0   | Belirgin fark   | ⚠️ **Zayıf:** MHA routing gücü var, araştırma devam    |
 | > 2.0       | Büyük fark      | ❌ **Olumsuz:** NS bu ölçekte yetersiz                   |
 
-**Mevcut tahmin (17 Mayıs 2026, GPT-S seed 42 step=2000 ara sonucu):**
+**Mevcut durum (17 Mayıs 2026 — v4 routing, 1B token karşılaştırması):**
 
 ```
-FluidLM-S s42 (final):  68.9726 PPL  @ step 6102
-GPT-S     s42 (ara):    48.8288 PPL  @ step 2000  →  ~38 PPL tahmin final
-Tahmini ΔPPL ≈ 30+  →  tablonun dışında, ❌ kesin olumsuz
+FluidLM-S s42 v4 @ 1B:  107.19 PPL  (best @ step 2000/2034)  ✅ TAMAMLANDI
+GPT-S     s42    @ 1B:    ?    PPL  (step 0/2034, yeni başladı)  🔄 devam
+
+Beklenen ΔPPL @ 1B: belirsiz — nano-pilot v4 −8.4 verdi;
+  S-ölçekte eşit ya da pozitif çıkabilir, GPT-S tamamlanınca güncellenecek.
+
+V1 @ 3B karşılaştırma (referans): FluidLM=68.97, GPT-S s42 final=~38 (tahmini)
+  V1 tahmini ΔPPL ≈ +30  → tablo dışında (❌ kesin olumsuz)
 ```
+
+> **V4 routing kritik ek bulgusu:** ν gradyanı +0.0099 → +0.1936 (+20×). Fiziksel parametreler artık güçlü biçimde öğreniyor. Bu RQ3'te çok daha güçlü bir doğrulama sağlar.
 
 > **Güncel Durum (v4 sonrası, 17 Mayıs 2026):**  
 > `fluidlm/ns_layer.py` içerik bağımlı hıza (v4) güncellendi — commit `6a27f5b`.  
