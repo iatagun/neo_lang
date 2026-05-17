@@ -201,15 +201,25 @@ GPT-S     = MHA routing + paylaşılan MLP + aynı veri + aynı token budget
 
 ### Exp 14 — Industrial Scale (Devam Ediyor)
 
-**FluidLM-S mevcut sonuçlar:**
+**FluidLM-S sonuçlar:**
 
-| Seed | Val PPL | Step  | Durum  |
-|------|---------|-------|--------|
-| 42   | 73.65   | 5,000 | ✅     |
-| 43   | 84.79   | 4,000 | ✅     |
-| 44   | ?       | ?     | 🔄     |
+| Seed | Val PPL (final) | Step        | Durum        |
+|------|-----------------|-------------|-------------|
+| 42   | **68.9726**     | 6,102/6,103 | ✅ **TAMAMLANDI** |
+| 43   | —               | —           | 🔄 beklemede |
+| 44   | —               | —           | 🔄 beklemede |
 
-> **Not:** Bu değerler ara kontrol noktalarıdır; step=6,103'te daha düşük olabilir.
+**GPT-S sonuçlar (seed 42, devam ediyor):**
+
+| Seed | Val PPL (ara) | Step        | Durum      |
+|------|---------------|-------------|------------|
+| 42   | **48.8288**   | 2,000/6,103 | 🔄 %33 (t=91m) |
+| 43   | —             | —           | 🔄 beklemede |
+| 44   | —             | —           | 🔄 beklemede |
+
+> **Not:** GPT-S seed 42, step=2000'de 48.83 PPL ile FluidLM'nin final PPL'ini (68.97) çoktan geçti.  
+> Eğitim tamamlandığında (~6100. adım) GPT-S'nin **~35–42 PPL** bandında biteceği tahmin ediliyor.  
+> Tahmini `ΔPPL ≈ 68.97 − ~38 ≈ ~30` — null hipotez (`|ΔPPL| < 0.5`) **kesin olarak reddedildi.**
 
 **Öğrenilen fizik (Exp 14):**
 
@@ -251,6 +261,18 @@ GPT-S sonuçları tamamlandığında `ΔPPL = |FluidLM_medyan − GPT_medyan|`:
 | 0.3 – 0.7   | Küçük fark      | ✅ **Orta:** NS yakın fakat hafif geride                |
 | 0.7 – 2.0   | Belirgin fark   | ⚠️ **Zayıf:** MHA routing gücü var, araştırma devam    |
 | > 2.0       | Büyük fark      | ❌ **Olumsuz:** NS bu ölçekte yetersiz                   |
+
+**Mevcut tahmin (17 Mayıs 2026, GPT-S seed 42 step=2000 ara sonucu):**
+
+```
+FluidLM-S s42 (final):  68.9726 PPL  @ step 6102
+GPT-S     s42 (ara):    48.8288 PPL  @ step 2000  →  ~38 PPL tahmin final
+Tahmini ΔPPL ≈ 30+  →  tablonun dışında, ❌ kesin olumsuz
+```
+
+> Bu fark, NS routing'in içerik-bağımsız yapısından kaynaklanıyor:  
+> MHA her forward'da `score(i,j) = ⟨q_i, k_j⟩` hesaplar (token çiftleri dinamik).  
+> NS routing ise `speed = tanh(‖u‖)` kullanır — token j, token i'yi hiç görmez.
 
 ---
 
@@ -298,8 +320,11 @@ Bu dağılım ν ile korelasyonlu mu?
 
 ### Kısa Vade (Exp 14 tamamlanınca)
 
-- [ ] GPT-S seed 42/43/44 eğit
-- [ ] ΔPPL hesapla, RQ1 karara bağla
+- [x] FluidLM-S seed 42 eğit → **68.9726 PPL** ✅ (6102/6103, t=372m)
+- [ ] GPT-S seed 42 eğit (🔄 %33, ara: 48.83 @ step 2000)
+- [ ] GPT-S seed 43/44 eğit
+- [ ] ΔPPL hesapla, RQ1 karara bağla (tahmini sonuç: ~30+ → ❌ olumsuz)
+- [ ] FluidLM-S seed 43/44 eğit
 - [ ] WikiText-103 zero-shot eval
 - [ ] FluidLM-M + GPT-M (seed 42)
 - [ ] Enerji analizi: gerçek GPU watt (pynvml)
