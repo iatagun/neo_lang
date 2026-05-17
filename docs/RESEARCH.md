@@ -199,35 +199,65 @@ GPT-S     = MHA routing + paylaşılan MLP + aynı veri + aynı token budget
 - NS routing ile MHA routing PPL farkı < 1.0 (tam karşılaştırma Exp 14'te)
 - 48 parametre ile 28.3M parametre arasındaki fark PPL'e yansımıyor
 
-### Exp 15 — Nano Pilot: İçerik Bağımlı Hız Ablasyonu (Tamamlandı)
+### Exp 15 — Nano Pilot: V4 Tam Koşu (20M Token, TAMAMLANDI)
 
-**Arka plan:** Exp 14, FluidLM-S'nin GPT-S'ye ~30 PPL bakımından geride kaldığını gösterdi.  
-Kök neden analizi: `speed = tanh(‖u‖)` içerik-bağımsız routing — MHA'nın `score(i,j) = ⟨q_i, k_j⟩` dinamizmini barındırmıyor.
+**Script:** `experiments/15_nano_pilot.py --model v4gpt --tokens 20e6`  
+**Yapılandırma:** d=256, L=6, seq=128, batch=8, grad_accum=8, total_steps=2,441
 
-**V4 Deneşi:** `speed_i = tanh(q_i · k_{i-1} / √d_k)` ile nano-ölçekte ablasyon (d=256, L=6, seq=128).
+**Sonuç (final @ step 2441):**
 
-| Model                | Val PPL @ step 200 | ΔPPL vs GPT |
-|---------------------|--------------------|--------------|
-| Fluid v1 (baseline) | ~1,214             | +324         |
-| Fluid v2            | ~1,100+            | +210+        |
-| Fluid v3 (per-ch.)  | ~1,050+            | +160+        |
-| **Fluid v4 (içerik)** | **882.1**        | **−8.4** ✅   |
-| GPT (MHA)           | 890.5              | —           |
+| Model         | Final val_ppl | Yorum                  |
+|--------------|---------------|------------------------|
+| FluidLM v4   | **402.77**    | content-dep speed      |
+| GPT-Nano     | **410.38**    | MHA                    |
+| **ΔPPL**     | **−7.61**     | **FluidLM v4 kazandı** |
 
-> **İlk kez: FluidLM, GPT'yi geçti.** ΔPPL = −8.4 @ step 200.  
-> v1'de `speed = tanh(‖u‖)` ile ΔPPL = +324 idi. V4 ile fark 332 PPL kapandı.
+**Eval noktası başına ΔPPL (step × PPL):**
 
-**V4 mekanizması:**
-```python
-q = W_q(u)                                          # [B, L, d_k]
-k = W_k(u)                                          # [B, L, d_k]
-k_prev = cat([zeros_like(k[:,:1]), k[:,:-1]], dim=1) # causal shift
-speed  = tanh((q * k_prev).sum(-1, keepdim=True) / d_k**0.5)  # [B, L, 1]
+| Step  | FluidLM v4 | GPT    | ΔPPL    | Kazanan     |
+|-------|-----------|--------|---------|-------------|
+| 200   | 882.1     | 890.5  | **−8.4**  | v4 ✅       |
+| 400   | 677.0     | 684.4  | **−7.4**  | v4 ✅       |
+| 600   | 637.3     | 600.8  | +36.4   | GPT ⚠️      |
+| 800   | 808.5     | 567.4  | +241.0  | GPT ❌ (spike!) |
+| 1000  | 462.3     | 497.5  | **−35.2** | v4 ✅       |
+| 1200  | 435.5     | 519.0  | **−83.5** | v4 ✅       |
+| 1400  | 552.6     | 447.9  | +104.6  | GPT ⚠️      |
+| 1600  | 551.4     | 393.3  | +158.1  | GPT ❌      |
+| 1800  | 441.9     | 398.5  | +43.4   | GPT ⚠️      |
+| 2000  | 334.9     | 435.8  | **−100.9** | v4 ✅      |
+| 2200  | 388.3     | 426.8  | **−38.5** | v4 ✅       |
+| 2400  | 363.7     | 364.9  | **−1.3**  | v4 ✅ (yaklaştı) |
+
+**Öğrenilen fizik — v4 nano final:**
+
+```
+Layer  0:  ν=0.0156  α=8.6463  p_scale=0.9747  dt=0.0385
+Layer  1:  ν=0.0198  α=1.4870  p_scale=0.9754  dt=0.0886
+Layer  2:  ν=0.0193  α=2.0536  p_scale=0.9585  dt=0.1213
+Layer  3:  ν=0.0178  α=1.3270  p_scale=0.9826  dt=0.1129
+Layer  4:  ν=0.0177  α=1.2402  p_scale=0.9886  dt=0.1230
+Layer  5:  ν=0.0178  α=1.4312  p_scale=0.9880  dt=0.1351
+ν gradient: +0.0000  (OLUŞMEDI ✗)
 ```
 
-**Parametre maliyeti:** `d_k = d_model // 8` → L=6 için 6 × 2 × (d × d_k) = minik ek yük.  
+**Üç kritik gozlem:**
 
-**Commit:** `6a27f5b` — `fluidlm/ns_layer.py` üretim paketine portlandi.
+1. **α Öğrendi:** Layer 0 = 8.65 (başlangıç: 1.0). Exp 14 v1'de α hiç oynamıyordu. V4 routing, α'nın gradyan almasını sağladı. S1 açık sorusunun ("neden öğrenmiyor?") kısmi yanıtı: routing kalitesi yeterliyse optimizer sinyali akıyor.
+
+2. **p_scale Öğrendi:** ~0.1 başlangıçtan ~0.97'ye. Başınc terimi şimdi neredeyse tam güçte çalışıyor.
+
+3. **ν gradyanı yok (nano'da):** Nano ölçekte (d=256, L=6) ν gradyanı oluşmuyor. Oysa S-ölçekte (d=768, L=12) +0.1936 görüldü. Bu, ν gradyanının **derinlik ve genişliğe bağlı** olduğunu işaret ediyor.
+
+**Yüksek varyans / instabilite sorunu:**  
+DeltaPPL step başına −1 ile +241 arasında salınıyor. Step 800'de v4 spike (808 PPL, GPT=567). Bu, W_q/W_k projektörlerinin LR ile birlikte olası gradyan patlamalarından kaynaklanıyor.
+
+**Hipotez:** `W_q`/`W_k` parametrelerine `grad_clip` veya daha düşük LR gerekiyor. Alternatif: `stop_gradient(k_prev)` — sadece query öğrenir.
+
+**Önerilen Exp 16 (S6):** Stabilite ablasyonu:
+- Deney A: `W_q`/`W_k` LR = `base_lr / 10`
+- Deney B: `k_prev.detach()` (tek yönlü gradyan)
+- Deney C: Larger `d_k` (d_model // 4)
 
 ### Exp 14 — Industrial Scale (Devam Ediyor)
 
@@ -330,6 +360,20 @@ V1 @ 3B karşılaştırma (referans): FluidLM=68.97, GPT-S s42 final=~38 (tahmin
 
 ## 7. Açık Sorular
 
+### S6 — V4 İnstabilitesi: W_q/W_k Gradyanı Kontrol Edilebilir mi?
+
+Nano-pilot ΔPPL step başına −1 ile +241 arasında salınıyor. Step 800 spike (ΔPPL=+241) kritik bir instabilite sinyali.
+
+**Üç hipo tez:**
+1. `W_q`/`W_k` gradyanları genel LR ile çok büyük adım atıyor
+2. `k_prev` üzerinden gelen backprop döngüsü (q₂ → k₁ → q₁) instabilite yaratıyor
+3. `d_k` çok küçük (d//8) — dot product varyansı yüksek
+
+**Aday çözümler:**
+- `W_q`/`W_k` için `lr_scale = 0.1` (10× düşük)
+- `k_prev = k_prev.detach()` — tek yönlü gradyan
+- `d_k = d_model // 4` — daha geniş projeksiyon
+
 ### S5 — V4 Düzeltmesi S-Ölçekte ΔPPL'i Kapatıyor mu?
 
 Nano-pilot (d=256, L=6) üzerninde v4, GPT'yi ΔPPL=−8.4 ile geçti.  
@@ -342,25 +386,14 @@ S-ölçekte (d=768, L=12) bu iyileştirmenin ~30 PPL açığı üzerine etkisi b
 
 **Sonraki adım:** `14_industrial_compare.py` v4 routing ile yeniden eğit (commit `6a27f5b` ile mevcut).
 
-### S1 — α ve p_scale Neden Öğrenmiyor?
+### S1 — α ve p_scale Neden Öğrenmiyor? (Kısmen Çözüldü)
 
-Exp 14 checkpoint'lerinde `α = 1.0` ve `p_scale = 0.1` değerleri başlangıç değerlerinde takılı.
+**Exp 14 v1:** `α = 1.0`, `p_scale = 0.1` — hiç oynamadı.  
+**Exp 15 v4 nano:** `α` = [1.23, 8.65] — öğrendi. `p_scale` ~0.97 — öğrendi.
 
-**Hipotezler:**
-1. Öğrenme hızı çok düşük (tüm parametreler aynı LR kullanıyor)
-2. Loss yüzeyi bu parametreler için çok yassı
-3. Basınç terimi zaten baskın — küçük değişimler loss'a yansımıyor
+**Yorum:** V4 routing, α ve p_scale için yeterli gradyan sinyali sağlıyor. V1'de `speed = tanh(‖u‖)` sabit olunca basınç grady anı maskelenıyordu. V4 içerik-bağlı hız, tüm fiziksel parametreleri "kilidinden kurtardı".
 
-**Çözüm adayı:** Ayrı parametre grubu ile daha yüksek LR:
-```python
-param_groups = [
-    {'params': [p for n,p in model.named_parameters() if 'log_alpha' in n or 'log_p_scale' in n],
-     'lr': 1e-2},   # 10× daha yüksek
-    {'params': [p for n,p in model.named_parameters() if 'log_alpha' not in n and 'log_p_scale' not in n],
-     'lr': 3e-4},
-]
-optimizer = torch.optim.AdamW(param_groups, weight_decay=0.1)
-```
+> Bu, S1 sorusunun yanıtıdır: sorun LR değil, routing kalitesiydi. Ayrı LR grubu önerisi artık gereksiz.
 
 ### S2 — Ölçek Yasası
 
@@ -382,20 +415,22 @@ Bu dağılım ν ile korelasyonlu mu?
 
 ## 8. Planlanan Çalışmalar
 
-### Kısa Vade (Exp 14 tamamlanınca)
+### Kısa Vade (Devam Eden)
 
 - [x] FluidLM-S seed 42 eğit → **68.9726 PPL** ✅ (6102/6103, t=372m)
 - [x] İçerik-bağımsız routing sorununu teşhis et (Exp 15 nano-pilot ablasyonu)
-- [x] V4 içerik-bağımlı hız: `NanoFluidLayerV4` implement et, nano'da ΔPPL=−8.4 doğrula ✅
+- [x] V4 içerik-bağımlı hız: `NanoFluidLayerV4` implement et ✅
+- [x] Nano-pilot 20M token tam koşus: **final ΔPPL = −7.61** ✅
+- [x] α ve p_scale öğrenememe sorunu çözüldü — v4 routing ile kendiliğinden öğreniyor ✅
 - [x] `fluidlm/ns_layer.py` üretim paketine v4 portla, commit `6a27f5b` ✅
-- [ ] GPT-S seed 42 eğit (🔄 %33, ara: 48.83 @ step 2000)
+- [ ] GPT-S seed 42 @ 1B eğit (🔄 devam)
+- [ ] Exp 14 v4: FluidLM-S s42 @ 1B (107.19 PPL) vs GPT-S s42 @ 1B karşılaştır
+- [ ] V4 instabilite ablasyonu — Exp 16: `k_prev.detach()` / LR scale / d_k deneyi
 - [ ] GPT-S seed 43/44 eğit
 - [ ] ΔPPL hesapla, RQ1 karara bağla
-- [ ] **Exp 14'i v4 routing ile yeniden çalıştır** (commit `6a27f5b` ile güncel — S-ölçekte etki ölç)
 - [ ] FluidLM-S seed 43/44 eğit
 - [ ] WikiText-103 zero-shot eval
 - [ ] FluidLM-M + GPT-M (seed 42)
-- [ ] Enerji analizi: gerçek GPU watt (pynvml)
 
 ### Orta Vade
 

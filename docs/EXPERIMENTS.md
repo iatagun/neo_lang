@@ -305,54 +305,78 @@ Warmup adımı     : 100 (cosine lr schedule)
 
 ---
 
-## 15 — Nano Pilot: İçerik Bağımlı Hız Ablasyonu (★★★)
+## 15 — Nano Pilot: İçerik Bağımlı Hız — Tam Koşu (★★★)
 
-**Script:** `experiments/15_nano_pilot.py`  
-**Durum:** ✅ V4 tamamlandı, commit `f279520` + `6a27f5b`
+**Script:** `experiments/15_nano_pilot.py --model v4gpt --tokens 20e6`  
+**Durum:** ✅ TAMAMLANDI — commit `f279520` + `6a27f5b`  
+**Yapılandırma:** d=256, L=6, seq=128, batch=8×8, total_steps=2,441
 
-### Motivasyon
+### Sonuçlar
 
-Exp 14, FluidLM-S'nin GPT-S'ye ~30 PPL bakımından geride kaldığını gösterdi.  
-Kok neden: `speed = tanh(‖u‖)` — token routing içerik-bağımsız, MHA'nın dinamik `score(i,j)` mekanizması yok.
+| Model       | Final val_ppl | ΔPPL   | Yorum                 |
+|------------|---------------|--------|-----------------------|
+| FluidLM v4 | **402.77**    | —      | content-dep speed     |
+| GPT-Nano   | **410.38**    | —      | MHA                   |
+| **Fark**   | —             | **−7.61** | **FluidLM v4 kazandı** |
 
-Nano-pilot (d=256, L=6, seq=128), dört routing stratejisini karstılık gösterdi:
+### ΔPPL Zaman Serisi
 
-| Model                | Val PPL @ step 200 | ΔPPL vs GPT |
-|---------------------|--------------------|--------------|
-| Fluid v1 (norm hız) | ~1,214             | +324         |
-| Fluid v2            | ~1,100+            | +210+        |
-| Fluid v3 (per-ch.)  | ~1,050+            | +160+        |
-| **Fluid v4 (içerik)** | **882.1**        | **−8.4** ✅   |
-| GPT (MHA)           | 890.5              | —           |
+| Step | v4 PPL | GPT PPL | ΔPPL    | Kazanan |
+|------|--------|---------|---------|---------|
+| 200  | 882.1  | 890.5   | −8.4    | v4 ✅   |
+| 400  | 677.0  | 684.4   | −7.4    | v4 ✅   |
+| 600  | 637.3  | 600.8   | +36.4   | GPT ⚠️  |
+| 800  | 808.5  | 567.4   | **+241.0** | GPT ❌ (spike!) |
+| 1000 | 462.3  | 497.5   | −35.2   | v4 ✅   |
+| 1200 | 435.5  | 519.0   | −83.5   | v4 ✅   |
+| 1400 | 552.6  | 447.9   | +104.6  | GPT ⚠️  |
+| 1600 | 551.4  | 393.3   | +158.1  | GPT ❌  |
+| 1800 | 441.9  | 398.5   | +43.4   | GPT ⚠️  |
+| 2000 | 334.9  | 435.8   | **−100.9** | v4 ✅ |
+| 2200 | 388.3  | 426.8   | −38.5   | v4 ✅   |
+| 2400 | 363.7  | 364.9   | −1.3    | v4 ✅ (yaklaştı) |
+
+> **Instabilite:** ΔPPL, step 800'de +241 spike yapıyor. `W_q`/`W_k` gradyanlarının LR ile birlikte patladığı düşünülüyor. Exp 16'da stabilite ablasyonu planlanıyor.
+
+### Öğrenilen Fiziksel Parametreler (Final)
+
+```
+Layer  ν        α        p_scale  dt
+  0    0.0156   8.6463   0.9747   0.0385
+  1    0.0198   1.4870   0.9754   0.0886
+  2    0.0193   2.0536   0.9585   0.1213
+  3    0.0178   1.3270   0.9826   0.1129
+  4    0.0177   1.2402   0.9886   0.1230
+  5    0.0178   1.4312   0.9880   0.1351
+ν gradient: +0.0000  (nano ölçekte oluşmadı)
+```
+
+**Kritik bulgular:**
+- **α öğrendi:** Başlangıç=1.0, final layer 0 = 8.65 → basınç terimi baskın katmanda çok daha güçlü
+- **p_scale öğrendi:** ~0.1 → ~0.97 → basınç tam güçte çalışıyor
+- **ν gradyanı yok (nano'da):** d=256, L=6 yeterince derin değil; S-ölçekte (d=768, L=12) +0.1936 görüldü
 
 ### V4 Mekanizması
 
 ```python
 # d_k = d_model // 8 (nano: 32, S-ölçek: 96)
-q     = W_q(u)                                         # [B, L, d_k]
-k     = W_k(u)                                         # [B, L, d_k]
-k_prev = cat([zeros_like(k[:,:1]), k[:,:-1]], dim=1)    # causal shift
+q      = W_q(u)                                          # [B, L, d_k]
+k      = W_k(u)                                          # [B, L, d_k]
+k_prev = cat([zeros_like(k[:,:1]), k[:,:-1]], dim=1)     # causal shift
 speed  = tanh((q * k_prev).sum(-1, keepdim=True) / d_k**0.5)  # [B, L, 1]
-adv    = speed * gradient(u, causal=True)               # [B, L, D]
+adv    = speed * gradient(u, causal=True)                # [B, L, D]
 ```
-
-**Fiziksel yorum:** Token i'nin taşıma hızı, bir önceki tokenin bağlamına göre dinamik belirlenir.  
-Bu, Reynolds sayısının içerik gated versiyonudur (gerçek türbülansı kapsayan biçim).
 
 ### Komutlar
 
 ```bash
-# V4 karstılıklı tüm modeller (v1/v2/v3/v4 + GPT)
-python experiments/15_nano_pilot.py --model all --tokens 20e6 --log_every 50 --eval_every 200
+# V4 + GPT tam koşu (20M token)
+python experiments/15_nano_pilot.py --model v4gpt --tokens 20e6 \
+    --log_every 50 --eval_every 200 --out results/15_v4gpt_pilot.json
 
-# Sadece v4 uzun koşu
-python experiments/15_nano_pilot.py --model fluid_v4 --tokens 20e6
+# Tüm versiyonlar (v1/v2/v3/v4 + GPT) — ablasyon
+python experiments/15_nano_pilot.py --model all --tokens 20e6 --eval_every 200
 ```
-
-### Sonraki Adım
-
-`fluidlm/ns_layer.py` üretim paketine portlandi (commit `6a27f5b`).  
-S-ölçekte Exp 14 yeniden çalıştırılarak ΔPPL etkisi ölçülmesi planlanıyor.
 
 
 ```bash
