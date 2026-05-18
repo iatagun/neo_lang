@@ -528,13 +528,11 @@ def train(name: str, model: nn.Module, token_budget: int,
     # Fiziksel parametreler
     phys = {}
     if isinstance(model, FluidLM_S):
-        nu_vals    = [l.log_nu.exp().item()    for l in model.layers]
-        alpha_vals = [l.log_alpha.exp().item() for l in model.layers]
-        dt_vals    = [l.log_dt.exp().item()    for l in model.layers]
-        phys = {"nu": nu_vals, "alpha": alpha_vals, "dt": dt_vals}
+        nu_vals = [l.log_nu.exp().item() for l in model.layers]
+        dt_vals = [l.log_dt.exp().item() for l in model.layers]
+        phys = {"nu": nu_vals, "dt": dt_vals}
         print(f"\n  [Fiziksel — {name}]"
               f"  nu_mean={sum(nu_vals)/len(nu_vals):.4f}"
-              f"  alpha_mean={sum(alpha_vals)/len(alpha_vals):.4f}"
               f"  dt_mean={sum(dt_vals)/len(dt_vals):.4f}")
 
     print(f"\n  [{name}] Eğitim bitti. Best PPL: {best_ppl:.4f}  ckpt: {best_ckpt}")
