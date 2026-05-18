@@ -229,13 +229,10 @@ class FluidLayerFFTAdv(nn.Module):
         n_freq = seq_len // 2 + 1
         self.n_freq = n_freq
 
-        self.log_nu      = nn.Parameter(torch.tensor(math.log(0.01)))
-        self.log_dt      = nn.Parameter(torch.tensor(math.log(0.05)))
-        self.log_alpha   = nn.Parameter(torch.tensor(0.0))
-        self.log_p_scale = nn.Parameter(torch.tensor(0.0))
+        self.log_nu  = nn.Parameter(torch.tensor(math.log(0.01)))
+        self.log_dt  = nn.Parameter(torch.tensor(math.log(0.05)))
 
-        self.log_mag     = nn.Parameter(torch.zeros(n_freq))
-        self.log_mag_lap = nn.Parameter(torch.zeros(n_freq))
+        self.log_mag = nn.Parameter(torch.zeros(n_freq))
 
         self._d_k = max(d_model // 8, 16)
         self.W_q  = nn.Linear(d_model, self._d_k, bias=False)
@@ -252,29 +249,17 @@ class FluidLayerFFTAdv(nn.Module):
         nn.init.normal_(self.mlp[0].weight, std=0.02)
         nn.init.normal_(self.mlp[2].weight, std=0.02 / math.sqrt(2))
 
-    def _fft_laplacian(self, u: torch.Tensor) -> torch.Tensor:
-        B, L, D = u.shape
-        U = torch.fft.rfft(u.float(), dim=1)
-        n_freq = U.shape[1]
-        k = torch.arange(n_freq, device=u.device, dtype=torch.float32)
-        lap_eig = 2.0 * (torch.cos(2.0 * math.pi * k / L) - 1.0)
-        if self.log_mag_lap.shape[0] != n_freq:
-            mag = F.interpolate(
-                self.log_mag_lap.view(1, 1, -1), size=n_freq,
-                mode="linear", align_corners=False
-            ).view(n_freq).exp()
-        else:
-            mag = self.log_mag_lap.exp()
-        filt = (mag * lap_eig).unsqueeze(0).unsqueeze(-1)
-        G    = torch.complex(U.real * filt, U.imag * filt)
-        return torch.fft.irfft(G, n=L, dim=1).to(u.dtype)
+    def _causal_laplacian(self, u: torch.Tensor) -> torch.Tensor:
+        """Causal 2nd-order backward difference: u[n] - 2*u[n-1] + u[n-2].
+        Strictly causal — uses only past tokens."""
+        u_p1 = torch.cat([torch.zeros_like(u[:, :1]), u[:, :-1]], dim=1)
+        u_p2 = torch.cat([torch.zeros_like(u[:, :2]), u[:, :-2]], dim=1)
+        return u - 2 * u_p1 + u_p2
 
     def forward(self, u: torch.Tensor) -> torch.Tensor:
-        x     = self.norm1(u)
-        nu    = self.log_nu.exp()
-        dt    = self.log_dt.exp()
-        alpha = self.log_alpha.exp()
-        p_sc  = self.log_p_scale.exp()
+        x  = self.norm1(u)
+        nu = self.log_nu.exp()
+        dt = self.log_dt.exp()
 
         q  = self.W_q(x)
         k  = self.W_k(x)
@@ -284,11 +269,8 @@ class FluidLayerFFTAdv(nn.Module):
         grad = fft_causal_gradient(x, self.log_mag)
         adv  = spd * grad
 
-        p  = spectral_pressure_fft(adv, alpha)
-        pg = p_sc * fft_causal_gradient(p.unsqueeze(-1).expand_as(x), self.log_mag)
-
-        visc = nu * self._fft_laplacian(x)
-        rhs  = -adv - pg + visc
+        visc = nu * self._causal_laplacian(x)
+        rhs  = -adv + visc
         u    = u + dt * rhs
         u    = u + self.mlp(self.norm2(u))
         return u
