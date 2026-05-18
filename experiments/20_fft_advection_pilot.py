@@ -94,6 +94,7 @@ class TokenStream:
     EOS_ID = 50256
     def __init__(self, split: str):
         self.buffer: List[int] = []
+        self._split = split
         self._load(split)
 
     def _load(self, split: str):
@@ -135,10 +136,7 @@ class TokenStream:
                 self.buffer.extend(encode(next(self._stream)["text"]))
                 self.buffer.append(self.EOS_ID)
             except StopIteration:
-                from datasets import load_dataset
-                ds = load_dataset("Skylion007/openwebtext", split="train",
-                                  streaming=True).shuffle(seed=random.randint(0,9999))
-                self._stream = iter(ds)
+                self._load(self._split)
 
     def get_batch(self, B: int, T: int) -> tuple[torch.Tensor, torch.Tensor]:
         need = (T + 1) * B
