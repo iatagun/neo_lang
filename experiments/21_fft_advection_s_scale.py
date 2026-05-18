@@ -151,24 +151,30 @@ class TokenStream:
 def fft_causal_gradient(u: torch.Tensor,
                         log_mag: torch.Tensor) -> torch.Tensor:
     """
-    Global causal gradient — frekans uzayında.
-    H(k) = 1 − e^{−2πik/L}  (backward difference, causal)
-    Ağırlık: exp(log_mag[k])  (öğrenilen spektral öncelik)
-    RF = full L, FLOP = O(L log L D)
-    log_mag, eğitim seq_len için tanımlı; farklı uzunluklarda interpolate edilir.
+    Causal backward-difference via zero-padded LINEAR convolution.
+    Zero-padding to 2L converts circular FFT convolution → linear convolution,
+    making the backward-difference filter h=[1,-1] strictly causal.
+    RF = full L (linear), FLOP = O(L log L · D).
+    log_mag (learned spectral weights) defined at training seq_len;
+    interpolated when called with a different length.
     """
     B, L, D = u.shape
-    U = torch.fft.rfft(u.float(), dim=1)          # [B, n_freq, D]
+    N = 2 * L                                      # zero-pad length
+
+    # Zero-pad sequence: [B, L, D] → [B, 2L, D]
+    u_pad = F.pad(u.float(), (0, 0, 0, L))         # pad time dim at right
+    U = torch.fft.rfft(u_pad, dim=1)               # [B, N//2+1, D]
     n_freq = U.shape[1]
 
+    # Backward-diff frequency response at length N: H(k) = 1 − e^{−2πik/N}
     k_idx = torch.arange(n_freq, device=u.device, dtype=torch.float32)
-    omega  = 2.0 * math.pi * k_idx / L
-
+    omega  = 2.0 * math.pi * k_idx / N
     H_r = 1.0 - torch.cos(omega)
-    H_i = torch.sin(omega)
+    H_i =       torch.sin(omega)
 
-    # log_mag eğitim uzunluğu için — farklı L'de interpolate et
-    if log_mag.shape[0] != n_freq:
+    # Interpolate learned spectral weights to n_freq (training: seq_len//2+1)
+    train_n_freq = log_mag.shape[0]
+    if train_n_freq != n_freq:
         mag = F.interpolate(
             log_mag.view(1, 1, -1), size=n_freq, mode="linear", align_corners=False
         ).view(n_freq).exp()
@@ -182,8 +188,9 @@ def fft_causal_gradient(u: torch.Tensor,
     Gr = Ur * F_r - Ui * F_i
     Gi = Ur * F_i + Ui * F_r
 
-    grad = torch.fft.irfft(torch.complex(Gr, Gi), n=L, dim=1).to(u.dtype)
-    return grad
+    # IFFT and take first L elements (discard circular-wrap tail)
+    out = torch.fft.irfft(torch.complex(Gr, Gi), n=N, dim=1)  # [B, 2L, D]
+    return out[:, :L, :].to(u.dtype)
 
 
 def spectral_pressure_fft(adv: torch.Tensor,
