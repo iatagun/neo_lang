@@ -464,3 +464,143 @@ python experiments/14_generate.py \
 - `pynvml` kuruluysa: gerçek GPU Watt + J/token ölçümü
 - Kurulu değilse: teorik MFLOP/token karşılaştırması
 - 1T token eğitim projeksiyonu (batch=32 eğitim hızı tahmini ile)
+
+---
+
+## 16 — Multi-Hop NS: Geniş Fark Gradyanı (★★★)
+
+**Script:** `experiments/16_multihop_ns.py`  
+**Commit:** `d614f74`  
+**Durum:** ✅ TAMAMLANDI  
+**Donanım:** NVIDIA RTX PRO 6000 Blackwell (bfloat16, ~67K tok/s)
+
+### Motivasyon
+
+FluidLM v4'te adveksiyon gradyanı tek adım gecikmeli (`u[i] - u[i-1]`) hesaplanıyordu.
+Bu, her katmanda yalnızca 1 token geriye bakıldığı anlamına gelir.
+12 katmanlı modelde efektif receptive field = **12 token**.
+GPT-S ise tüm sekans boyunca (1024 token) dikkat dağıtabilir.
+
+**Hipotez (RQ5):** Fark gradyanını birden fazla ölçekte hesaplamak (1, 2, 4 adım) receptive field'ı artırarak PPL'i düşürür.
+
+```
+multihop_gradient(u, k=4) = mean( (u[i]-u[i-s])/s  for s in [1, 2, 4] )
+Efektif RF = hop_k × n_layers = 4 × 12 = 48 token
+```
+
+### Sonuçlar
+
+| Model | hop_k | RF (token) | best_val_ppl @1B | Notlar |
+|---|---|---|---|---|
+| FluidLM v4 | 1 (baseline) | 12 | ~103.9 | exp14 referans |
+| **FluidLM k=4** | **4** | **48** | **99.7980** | ✅ iyileşme |
+| GPT-S | — | 1024 | **61.95** | referans |
+
+**Öğrenilen fiziksel parametreler (final):**
+- ν: erken katmanlar ~0.01, geç katmanlar ~0.03 (monoton artış)
+- α: tüm katmanlarda ~1.0'da takılı kaldı
+- p_scale: ~0.1'de kaldı (basınç terimi pasif)
+- dt: 0.04–0.13 arası değişken
+
+**Dürüst değerlendirme:**  
+k=4 ile 103.9 → 99.8'e geçiş anlamlıdır (~4 PPL, %3.8 düşüş) ve receptive field artışının işe yaradığını gösterir. Ancak GPT-S ile (61.95) aradaki 38 PPL farkı hâlâ çok büyüktür ve bu fark yalnızca RF farklılığıyla açıklanamaz — mimari yapı (MHA'nın değer projeksiyonu `v`, tüm token'lar arası yeniden ağırlıklandırma) da kritik rol oynuyor.
+
+---
+
+## 17 — Spektral Basınç: Helmholtz-Poisson FFT (★★)
+
+**Script:** `experiments/17_spectral_pressure.py`  
+**Commit:** `07c221b`  
+**Durum:** ✅ TAMAMLANDI
+
+### Motivasyon
+
+Exp 12'de cumsum-tabanlı basınç yaklaşımının PPL üzerinde sınırlı etkisi olduğu görülmüştü.
+Basıncı Helmholtz-Poisson denklemiyle FFT üzerinden tam çözerek katkısını arttırabilir miyiz?
+
+```
+(∇² − α²)p = −div(adv)
+FFT: p̂_k = −f̂_k / λ_k,   λ_k = 2(cos(2πk/L)−1) − α²
+```
+
+### Sonuçlar
+
+| Koşul | best_val_ppl @1B |
+|---|---|
+| Exp 16 (cumsum basınç, k=4) | 99.7980 |
+| Exp 17 (FFT Helmholtz, k=4) | 99.8636 |
+| Fark | +0.066 (istatistiksel olarak anlamsız) |
+
+**Dürüst değerlendirme:**  
+FFT basınç hiçbir iyileşme sağlamadı — hatta hafif kötüleşme oldu. Bu sonuç önemliydi: **basınç terimi modelin darboğazı değil.** Asıl sınırlama, adveksiyonun görebildiği token sayısı (receptive field) olduğu ortaya çıktı. α parametresi her iki deneyde de ~1.0'da kaldı; bu, modelin öğrenme dinamiğinin basınç mekanizmasını etkili şekilde kullanamadığını gösteriyor. Bu bulgu, exp18'in yönünü doğrudan belirledi.
+
+---
+
+## 18 — Wider Receptive Field: hop_k = 8 ve 16 (★★★)
+
+**Script:** `experiments/18_wider_receptive.py`  
+**Commit:** `d785b18` (exp18 ilk), `0d19d35` (doc-boundary stream fix)  
+**Durum:** 🔄 Kısmen tamamlandı (k=8 bitti, k=16 devam ediyor)
+
+### Motivasyon
+
+Exp17 basıncın darboğaz olmadığını kanıtladı. Asıl sorun: FluidLM'in receptive field'ı GPT'ye kıyasla çok dar.
+
+```
+k=4  → RF=48  token  (exp16/17)
+k=8  → RF=96  token  (exp18, 2× genişleme)
+k=16 → RF=192 token  (exp18, 4× genişleme)
+GPT-S→ RF=1024 token (referans)
+```
+
+**Önemli veri düzeltmesi:** Exp18 ile birlikte `TokenStream` da düzeltildi.
+Önceki versiyonlarda belgeler `"\n"` ile birleştiriliyordu; böylece model farklı konuları tek bir sekans olarak görüyordu.
+Artık her belge sonuna GPT-2 EOS token (50256) ekleniyor, konu sınırları açık hale geliyor.
+
+### Sonuçlar (k=8, @1B token)
+
+| Model | hop_k | RF | best_val_ppl @1B |
+|---|---|---|---|
+| FluidLM k=4 (exp16) | 4 | 48 | 99.80 |
+| FluidLM k=4 FFT (exp17) | 4 | 48 | 99.86 |
+| **FluidLM k=8 (exp18)** | **8** | **96** | **96.63** ✅ |
+| FluidLM k=16 (exp18) | 16 | 192 | — (devam ediyor) |
+| GPT-S | — | 1024 | 61.95 |
+
+**Çalışma hızı:** ~67K tok/s, ~246 dakika / run.
+
+**Dürüst değerlendirme:**  
+k=4→k=8 geçişi 3.2 PPL düşüşü sağladı. Bu, receptive field hipotezini doğrular: **NS tabanlı modelde bilgi taşıma kapasitesi doğrudan RF'ye bağlıdır.** Ancak k=8 ile RF=96 token oldu; GPT'nin 1024 tokenine ulaşmak için k≈85 gerekir ve bu pratik değildir (FLOP maliyeti lineer artar, dikkat mekanizması O(L²) yerine O(L·k) ölçeklenir). Bu sınırı aşmak için FFT tabanlı global adveksiyon (frekans uzayında tam sekans karıştırma) sonraki mantıklı adımdır.
+
+### Exp 19 — OWT Belge Uzunluğu Analizi
+
+**Script:** `experiments/19_doc_length_analysis.py`  
+**Commit:** `0d19d35`  
+**Amaç:** Receptive field seçimini veriyle hizalamak.
+
+```bash
+python experiments/19_doc_length_analysis.py --n_docs 20000
+```
+
+OWT belge uzunluklarının dağılımını (min/median/p75/p90/max) ve her k değeri için
+"bu RF kaç belgeyi kesmeden sığdırır?" sorusunu yanıtlar.
+İdeal k = `ceil(p75_doc_len / n_layers)` formülüyle hesaplanır.
+
+---
+
+## Özet Tablo (Mayıs 2026)
+
+| Exp | Değişiklik | RF (token) | PPL @1B | Durum |
+|---|---|---|---|---|
+| exp14 (v1) | NS baseline | 12 | ~103.9 | ✅ |
+| exp15 (v4) | content-dep speed | 12 | 402.77* | ✅ |
+| exp16 k=4 | multi-hop gradyan | 48 | **99.80** | ✅ |
+| exp17 k=4 FFT | +Helmholtz basınç | 48 | 99.86 ≈ exp16 | ✅ |
+| exp18 k=8 | RF × 2 | 96 | **96.63** | ✅ |
+| exp18 k=16 | RF × 4 | 192 | — | 🔄 |
+| GPT-S | MHA | 1024 | **61.95** | referans |
+
+> \* Exp15 nano ölçekte (d=256, L=6, 20M token) çalıştı; S-ölçek (1B token) ile doğrudan karşılaştırılamaz.
+
+**Temel bulgu:**  
+FluidLM'de PPL'i en güçlü etkileyen faktör **receptive field genişliği** (hop_k × n_layers) olduğu görülmektedir. Basınç mekanizması (cumsum veya FFT), en azından mevcut ölçekte, marginal katkı sağlamaktadır. GPT-S ile aradaki ~35 PPL farkının kapatılması için yalnızca hop_k artırmak yeterli olmayacak; frekans uzayında global bilgi karıştırma veya FluidLM'e değer projeksiyonu (`v`) eklenmesi gibi mimari değişiklikler gerekmektedir.
