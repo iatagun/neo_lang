@@ -155,6 +155,17 @@ except ImportError:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TokenStream:
+    """Belge-sınırı farkında token akışı.
+
+    OpenWebText belgeleri arasına EOS token (50256) eklenir.
+    Bu sayede model konu geçişlerini öğrenir; receptive field
+    analizi de anlamlı hale gelir — bir pencere nadiren iki
+    farklı konuyu birden görür.
+    """
+
+    # GPT-2 BPE EOS token id
+    EOS_ID: int = 50256
+
     def __init__(self, split: str, seq_len: int, device: torch.device):
         self.seq_len = seq_len; self.device = device
         self.buffer: List[int] = []
@@ -172,6 +183,7 @@ class TokenStream:
                 self._stream = iter(ds)
                 self._source = "openwebtext"
                 master_print(f"[Data] OpenWebText stream hazir ({split})")
+                master_print(f"[Data] Belge sınırlarına EOS ({self.EOS_ID}) ekleniyor")
                 return
             except Exception as e:
                 master_print(f"[Data] OpenWebText yuklenemedi: {e}")
@@ -203,10 +215,14 @@ class TokenStream:
         self._source = "shakespeare"
 
     def _next_from_stream(self, n_tokens: int) -> List[int]:
+        """Belgeleri EOS ile ayırarak buffer'a ekler."""
         buf: List[int] = []
         while len(buf) < n_tokens:
             try:
-                buf.extend(encode(next(self._stream)["text"] + "\n"))
+                doc_tokens = encode(next(self._stream)["text"])
+                # Her belgenin sonuna EOS token ekle
+                buf.extend(doc_tokens)
+                buf.append(self.EOS_ID)
             except StopIteration:
                 from datasets import load_dataset
                 ds = load_dataset("Skylion007/openwebtext", split="train",
