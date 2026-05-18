@@ -485,9 +485,9 @@ def train(name: str, model: nn.Module, token_budget: int) -> dict:
 
         x, y = train_stream.get_batch(args.batch_size, args.seq_len)
         with AUTOCAST:
-            loss = F.cross_entropy(model(x).view(-1, model.head.out_features
-                                   if hasattr(model, "head") else VOCAB),
-                                   y.view(-1))
+            logits = model(x)
+            vocab  = logits.size(-1)
+            loss   = F.cross_entropy(logits.reshape(-1, vocab), y.reshape(-1))
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
