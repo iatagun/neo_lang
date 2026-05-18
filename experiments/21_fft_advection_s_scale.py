@@ -148,48 +148,33 @@ class TokenStream:
 # Operatörler
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fft_causal_gradient(u: torch.Tensor,
-                        log_mag: torch.Tensor) -> torch.Tensor:
+def fft_causal_conv(u: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     """
-    Causal backward-difference via zero-padded LINEAR convolution.
-    Zero-padding to 2L converts circular FFT convolution → linear convolution,
-    making the backward-difference filter h=[1,-1] strictly causal.
-    RF = full L (linear), FLOP = O(L log L · D).
-    log_mag (learned spectral weights) defined at training seq_len;
-    interpolated when called with a different length.
+    Strictly causal linear convolution via zero-padded FFT.
+
+    kernel : [K] time-domain causal filter, support n=0..K-1.
+    Causal guarantee: kernel is padded on the RIGHT to length 2L before FFT,
+    so the DFT sees no negative-lag components. Only kernel[:L] can influence
+    output positions 0..L-1, and kernel[m] can only "look back" m steps.
+
+    out[n] = Σ_{m=0}^{min(n,K-1)} kernel[m] · u[n-m]   (past-only)
+    FLOP = O(L log L · D), RF = min(K, L).
     """
     B, L, D = u.shape
-    N = 2 * L                                      # zero-pad length
+    N = 2 * L
 
-    # Zero-pad sequence: [B, L, D] → [B, 2L, D]
-    u_pad = F.pad(u.float(), (0, 0, 0, L))         # pad time dim at right
-    U = torch.fft.rfft(u_pad, dim=1)               # [B, N//2+1, D]
-    n_freq = U.shape[1]
+    # Truncate kernel to L (taps beyond L don't affect output[0..L-1])
+    k_eff = kernel[:L] if kernel.shape[0] >= L else kernel   # [≤L]
+    # Right-pad to N=2L — THIS is what ensures causality in the DFT sense
+    k_pad = F.pad(k_eff.float(), (0, N - k_eff.shape[0]))    # [2L]
+    K_fft = torch.fft.rfft(k_pad)                            # [L+1]
 
-    # Backward-diff frequency response at length N: H(k) = 1 − e^{−2πik/N}
-    k_idx = torch.arange(n_freq, device=u.device, dtype=torch.float32)
-    omega  = 2.0 * math.pi * k_idx / N
-    H_r = 1.0 - torch.cos(omega)
-    H_i =       torch.sin(omega)
+    u_pad = F.pad(u.float(), (0, 0, 0, L))                   # [B, 2L, D]
+    U = torch.fft.rfft(u_pad, dim=1)                         # [B, L+1, D]
 
-    # Interpolate learned spectral weights to n_freq (training: seq_len//2+1)
-    train_n_freq = log_mag.shape[0]
-    if train_n_freq != n_freq:
-        mag = F.interpolate(
-            log_mag.view(1, 1, -1), size=n_freq, mode="linear", align_corners=False
-        ).view(n_freq).exp()
-    else:
-        mag = log_mag.exp()
-
-    F_r = (mag * H_r).unsqueeze(0).unsqueeze(-1)   # [1, n_freq, 1]
-    F_i = (mag * H_i).unsqueeze(0).unsqueeze(-1)
-
-    Ur, Ui = U.real, U.imag
-    Gr = Ur * F_r - Ui * F_i
-    Gi = Ur * F_i + Ui * F_r
-
-    # IFFT and take first L elements (discard circular-wrap tail)
-    out = torch.fft.irfft(torch.complex(Gr, Gi), n=N, dim=1)  # [B, 2L, D]
+    out = torch.fft.irfft(
+        U * K_fft.unsqueeze(0).unsqueeze(-1), n=N, dim=1
+    )  # [B, 2L, D]
     return out[:, :L, :].to(u.dtype)
 
 
@@ -222,24 +207,27 @@ def spectral_pressure_fft(adv: torch.Tensor,
 class FluidLayerFFTAdv(nn.Module):
     """
     FFT Advection katmanı — S ölçeği.
-    exp20'de nano-scale'de GPT-nano'yu 12× geride bırakan mimari.
 
-    Parametreler (S ölçeği):
-      log_mag     : [513]  — advection spektral ağırlığı
-      log_mag_lap : [513]  — viskozite spektral ağırlığı
-      log_nu, log_dt, log_alpha, log_p_scale: fiziksel scalar'lar
-      W_q, W_k: [768 × 96]  — content-dependent hız (d_k = d//8)
-      LayerNorm × 2, MLP(768→3072→768)
+    Parametreler:
+      kernel  : [seq_len] — causal time-domain conv kernel (init ≈ backward diff)
+      log_nu, log_dt: fiziksel scalar'lar
+      W_q, W_k: [d_model × d_k] — content-dependent advection velocity
+      LayerNorm × 2, MLP(d_model → 4d → d_model)
+
+    Causality: kernel is right-padded before FFT → strictly causal linear conv.
     """
     def __init__(self, d_model: int, seq_len: int, mlp_ratio: int = 4):
         super().__init__()
-        n_freq = seq_len // 2 + 1
-        self.n_freq = n_freq
+        self.seq_len = seq_len
 
-        self.log_nu  = nn.Parameter(torch.tensor(math.log(0.01)))
-        self.log_dt  = nn.Parameter(torch.tensor(math.log(0.05)))
+        self.log_nu = nn.Parameter(torch.tensor(math.log(0.01)))
+        self.log_dt = nn.Parameter(torch.tensor(math.log(0.05)))
 
-        self.log_mag = nn.Parameter(torch.zeros(n_freq))
+        # Causal convolution kernel in TIME domain — init ≈ backward difference
+        self.kernel = nn.Parameter(torch.zeros(seq_len))
+        with torch.no_grad():
+            self.kernel[0] =  1.0
+            self.kernel[1] = -1.0
 
         self._d_k = max(d_model // 8, 16)
         self.W_q  = nn.Linear(d_model, self._d_k, bias=False)
@@ -273,7 +261,7 @@ class FluidLayerFFTAdv(nn.Module):
         kp = torch.cat([torch.zeros_like(k[:, :1]), k[:, :-1]], dim=1)
         spd = torch.tanh((q * kp).sum(-1, keepdim=True) / (self._d_k ** 0.5))
 
-        grad = fft_causal_gradient(x, self.log_mag)
+        grad = fft_causal_conv(x, self.kernel)
         adv  = spd * grad
 
         visc = nu * self._causal_laplacian(x)
@@ -283,7 +271,10 @@ class FluidLayerFFTAdv(nn.Module):
         return u
 
     def spectral_profile(self) -> dict:
-        mag = self.log_mag.exp().detach().cpu()
+        # Compute frequency magnitude of the learned causal kernel
+        L = self.kernel.shape[0]
+        k_pad = F.pad(self.kernel.detach().float(), (0, L))
+        mag = torch.fft.rfft(k_pad).abs().cpu()
         n   = len(mag)
         return {
             "mean":           mag.mean().item(),
