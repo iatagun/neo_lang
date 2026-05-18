@@ -60,6 +60,8 @@ parser.add_argument("--grad_accum",   type=int,   default=15)
 parser.add_argument("--lr",           type=float, default=3e-4)
 parser.add_argument("--min_lr",       type=float, default=3e-5)
 parser.add_argument("--warmup_frac",  type=float, default=0.01)
+parser.add_argument("--decay_frac",   type=float, default=0.20,
+                    help="WSD: cosine decay starts at (1-decay_frac)*total_steps")
 parser.add_argument("--weight_decay", type=float, default=0.1)
 parser.add_argument("--grad_clip",    type=float, default=1.0)
 parser.add_argument("--seed",         type=int,   default=42)
@@ -421,9 +423,10 @@ def train(name: str, model: nn.Module, token_budget: int,
     scaler = torch.amp.GradScaler("cuda",
                                    enabled=(device.type == "cuda" and not USE_BF16))
 
-    total_steps = int(token_budget) // eff_batch
-    warmup      = max(100, int(total_steps * args.warmup_frac))
-    print(f"  Toplam adım: {total_steps}  warmup: {warmup}")
+    total_steps  = int(token_budget) // eff_batch
+    warmup       = max(100, int(total_steps * args.warmup_frac))
+    decay_start  = int(total_steps * (1.0 - args.decay_frac))
+    print(f"  Toplam adım: {total_steps}  warmup: {warmup}  decay_start: {decay_start}")
 
     train_stream = TokenStream("train")
     val_stream   = TokenStream("val")
@@ -437,11 +440,16 @@ def train(name: str, model: nn.Module, token_budget: int,
     optimizer.zero_grad(set_to_none=True)
 
     for step in range(total_steps):
-        # Cosine LR
+        # WSD (Warmup-Stable-Decay) LR schedule
         if step < warmup:
+            # Phase 1: linear warmup
             lr = args.lr * (step + 1) / max(1, warmup)
+        elif step < decay_start:
+            # Phase 2: stable at peak LR
+            lr = args.lr
         else:
-            prog = (step - warmup) / max(1, total_steps - warmup)
+            # Phase 3: cosine decay to min_lr
+            prog = (step - decay_start) / max(1, total_steps - decay_start)
             lr   = args.min_lr + 0.5 * (args.lr - args.min_lr) * (
                 1.0 + math.cos(math.pi * prog))
         for pg in optimizer.param_groups:
