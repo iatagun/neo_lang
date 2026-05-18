@@ -155,16 +155,25 @@ def fft_causal_gradient(u: torch.Tensor,
     H(k) = 1 − e^{−2πik/L}  (backward difference, causal)
     Ağırlık: exp(log_mag[k])  (öğrenilen spektral öncelik)
     RF = full L, FLOP = O(L log L D)
+    log_mag, eğitim seq_len için tanımlı; farklı uzunluklarda interpolate edilir.
     """
     B, L, D = u.shape
     U = torch.fft.rfft(u.float(), dim=1)          # [B, n_freq, D]
+    n_freq = U.shape[1]
 
-    k_idx = torch.arange(U.shape[1], device=u.device, dtype=torch.float32)
+    k_idx = torch.arange(n_freq, device=u.device, dtype=torch.float32)
     omega  = 2.0 * math.pi * k_idx / L
 
     H_r = 1.0 - torch.cos(omega)
     H_i = torch.sin(omega)
-    mag  = log_mag.exp()
+
+    # log_mag eğitim uzunluğu için — farklı L'de interpolate et
+    if log_mag.shape[0] != n_freq:
+        mag = F.interpolate(
+            log_mag.view(1, 1, -1), size=n_freq, mode="linear", align_corners=False
+        ).view(n_freq).exp()
+    else:
+        mag = log_mag.exp()
 
     F_r = (mag * H_r).unsqueeze(0).unsqueeze(-1)   # [1, n_freq, 1]
     F_i = (mag * H_i).unsqueeze(0).unsqueeze(-1)
@@ -246,9 +255,16 @@ class FluidLayerFFTAdv(nn.Module):
     def _fft_laplacian(self, u: torch.Tensor) -> torch.Tensor:
         B, L, D = u.shape
         U = torch.fft.rfft(u.float(), dim=1)
-        k = torch.arange(U.shape[1], device=u.device, dtype=torch.float32)
+        n_freq = U.shape[1]
+        k = torch.arange(n_freq, device=u.device, dtype=torch.float32)
         lap_eig = 2.0 * (torch.cos(2.0 * math.pi * k / L) - 1.0)
-        mag  = self.log_mag_lap.exp()
+        if self.log_mag_lap.shape[0] != n_freq:
+            mag = F.interpolate(
+                self.log_mag_lap.view(1, 1, -1), size=n_freq,
+                mode="linear", align_corners=False
+            ).view(n_freq).exp()
+        else:
+            mag = self.log_mag_lap.exp()
         filt = (mag * lap_eig).unsqueeze(0).unsqueeze(-1)
         G    = torch.complex(U.real * filt, U.imag * filt)
         return torch.fft.irfft(G, n=L, dim=1).to(u.dtype)
