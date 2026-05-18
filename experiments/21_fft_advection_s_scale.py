@@ -499,6 +499,15 @@ def train(name: str, model: nn.Module, token_budget: int,
                     "model_state": model.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
                     "args": vars(args),
+                    "model_type": "fluid_fft",
+                    "cfg": {
+                        "vocab_size": vocab_size,
+                        "d_model": args.d_model,
+                        "n_layers": args.n_layers,
+                        "n_heads": args.n_heads,
+                        "seq_len": args.seq_len,
+                        "mlp_ratio": args.mlp_ratio,
+                    },
                 }, best_ckpt)
 
             print(

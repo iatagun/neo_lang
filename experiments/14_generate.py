@@ -483,6 +483,21 @@ def load_model(ckpt_path: str):
             hop_k        = cfg.get("hop_k", 1),
             use_spectral = cfg.get("use_spectral", False),
         )
+    elif model_type == "fluid_fft":
+        # exp21: FluidLM_S (FFT advection) — dinamik import
+        import importlib.util, sys as _sys
+        _spec = importlib.util.spec_from_file_location(
+            "exp21",
+            os.path.join(os.path.dirname(__file__), "21_fft_advection_s_scale.py"))
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        model = _mod.FluidLM_S(
+            vocab_size = cfg["vocab_size"],
+            d_model    = cfg["d_model"],
+            n_layers   = cfg["n_layers"],
+            seq_len    = cfg["seq_len"],
+            mlp_ratio  = cfg.get("mlp_ratio", 4),
+        )
     else:
         model = GPTBaseline(
             vocab_size   = cfg["vocab_size"],
