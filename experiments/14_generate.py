@@ -82,8 +82,31 @@ def causal_laplacian(u):
 def causal_divergence(u):
     return causal_gradient(u).mean(dim=-1)
 
-def spectral_pressure(adv, alpha):
-    div  = causal_divergence(adv)
+def _hop_scales(k):
+    if k <= 1: return [1]
+    return [2**i for i in range(int(math.log2(k)) + 1)]
+
+def multihop_gradient(u, k=4):
+    scales = _hop_scales(k)
+    total  = torch.zeros_like(u)
+    for s in scales:
+        p     = F.pad(u, (0, 0, s, 0))[:, :-s, :]
+        total = total + (u - p) / s
+    return total / len(scales)
+
+def multihop_laplacian(u, k=4):
+    scales = _hop_scales(k)
+    total  = torch.zeros_like(u)
+    for s in scales:
+        p     = F.pad(u, (0, 0, 2 * s, 0))
+        total = total + (u - 2 * p[:, s:-s, :] + p[:, :-2*s, :]) / (s * s)
+    return total / len(scales)
+
+def multihop_divergence(u, k=4):
+    return multihop_gradient(u, k).mean(dim=-1)
+
+def spectral_pressure(adv, alpha, hop_k=1):
+    div  = multihop_divergence(adv, hop_k) if hop_k > 1 else causal_divergence(adv)
     B, L = div.shape
     f    = torch.fft.rfft(div.float(), dim=1)
     k    = torch.arange(L // 2 + 1, dtype=torch.float32, device=div.device)
@@ -93,14 +116,27 @@ def spectral_pressure(adv, alpha):
     p    = torch.fft.irfft(-f / lam.unsqueeze(0), n=L, dim=1).to(adv.dtype)
     return p / (p.detach().std(dim=1, keepdim=True).clamp(min=0.5) + 1e-6)
 
+def cumsum_pressure(adv, alpha, hop_k=1):
+    div_adv = multihop_divergence(adv, hop_k) if hop_k > 1 else causal_divergence(adv)
+    cumsum  = torch.cumsum(-div_adv, dim=1)
+    cumsum  = cumsum / (cumsum.std(dim=1, keepdim=True).detach() + 1e-6)
+    return cumsum / (alpha + 1e-6)
+
 class FluidLayer(nn.Module):
     def __init__(self, d_model, nu=0.01, dt=0.05, alpha=1.0,
-                 mlp_ratio=4, dropout=0.0):
+                 mlp_ratio=4, dropout=0.0,
+                 hop_k=1, use_spectral=False):
         super().__init__()
+        self.hop_k        = hop_k
+        self.use_spectral = use_spectral
         self.log_nu      = nn.Parameter(torch.tensor(math.log(nu)))
         self.log_dt      = nn.Parameter(torch.tensor(math.log(dt)))
         self.log_alpha   = nn.Parameter(torch.tensor(math.log(alpha)))
-        self.log_p_scale = nn.Parameter(torch.tensor(math.log(0.1)))
+        self.log_p_scale = nn.Parameter(torch.tensor(0.0))
+        # v4 content-dependent speed (W_q/W_k)
+        self._d_k = max(d_model // 8, 16)
+        self.W_q  = nn.Linear(d_model, self._d_k, bias=False)
+        self.W_k  = nn.Linear(d_model, self._d_k, bias=False)
         hidden = d_model * mlp_ratio
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
@@ -117,11 +153,27 @@ class FluidLayer(nn.Module):
     @property
     def p_scale(self): return self.log_p_scale.exp()
     def _rhs(self, u):
-        speed  = torch.tanh(u.norm(dim=-1, keepdim=True))
-        adv    = speed * causal_gradient(u)
-        p      = spectral_pressure(adv, self.alpha)
-        p_grad = self.p_scale * causal_gradient(p.unsqueeze(-1)).expand_as(u)
-        visc   = self.nu * causal_laplacian(u)
+        # v4 speed
+        q      = self.W_q(u)
+        k      = self.W_k(u)
+        k_prev = torch.cat([torch.zeros_like(k[:, :1]), k[:, :-1]], dim=1)
+        speed  = torch.tanh((q * k_prev).sum(-1, keepdim=True) / (self._d_k ** 0.5))
+        # multi-hop advection
+        grad_fn = multihop_gradient if self.hop_k > 1 else causal_gradient
+        adv     = speed * (grad_fn(u, self.hop_k) if self.hop_k > 1 else grad_fn(u))
+        # pressure
+        if self.use_spectral:
+            p = spectral_pressure(adv, self.alpha, self.hop_k)
+        else:
+            div_adv = multihop_divergence(adv, self.hop_k) if self.hop_k > 1 else causal_divergence(adv)
+            cumsum  = torch.cumsum(-div_adv, dim=1)
+            cumsum  = cumsum / (cumsum.std(dim=1, keepdim=True).detach() + 1e-6)
+            p       = cumsum / (self.alpha + 1e-6)
+        p_grad  = self.p_scale * (multihop_gradient(p.unsqueeze(-1), self.hop_k)
+                                   if self.hop_k > 1 else
+                                   causal_gradient(p.unsqueeze(-1))).expand_as(u)
+        visc_fn = multihop_laplacian if self.hop_k > 1 else causal_laplacian
+        visc    = self.nu * (visc_fn(u, self.hop_k) if self.hop_k > 1 else visc_fn(u))
         return -adv - p_grad + visc
     def forward(self, u):
         u = u + self.dt * self._rhs(self.norm1(u))
@@ -130,7 +182,7 @@ class FluidLayer(nn.Module):
 
 class FluidLM(nn.Module):
     def __init__(self, vocab_size, d_model, n_layers, max_seq_len,
-                 mlp_ratio=4, dropout=0.0):
+                 mlp_ratio=4, dropout=0.0, hop_k=1, use_spectral=False):
         super().__init__()
         self.d_model   = d_model
         self.n_layers  = n_layers
@@ -138,7 +190,9 @@ class FluidLM(nn.Module):
         self.pos_emb   = nn.Embedding(max_seq_len, d_model)
         self.drop_emb  = nn.Dropout(dropout)
         self.layers    = nn.ModuleList([
-            FluidLayer(d_model, mlp_ratio=mlp_ratio) for _ in range(n_layers)
+            FluidLayer(d_model, mlp_ratio=mlp_ratio,
+                       hop_k=hop_k, use_spectral=use_spectral)
+            for _ in range(n_layers)
         ])
         self.norm    = nn.LayerNorm(d_model)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
@@ -426,6 +480,8 @@ def load_model(ckpt_path: str):
             n_layers     = cfg["n_layers"],
             max_seq_len  = cfg["seq_len"],
             mlp_ratio    = cfg.get("mlp_ratio", 4),
+            hop_k        = cfg.get("hop_k", 1),
+            use_spectral = cfg.get("use_spectral", False),
         )
     else:
         model = GPTBaseline(
