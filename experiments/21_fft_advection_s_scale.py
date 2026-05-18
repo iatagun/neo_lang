@@ -584,7 +584,6 @@ if __name__ == "__main__":
     print(f"  EXP 21 — FFT Advection S-Scale")
     print(f"  d={D}  L={L}  seq={T}  heads={H}")
     print(f"  tokens={token_budget/1e9:.1f}B  steps={total_steps}")
-    print(f"  GPT-S baseline: 61.95 PPL")
     print(f"{'='*57}")
 
     print(f"\n  Receptive Field:")
@@ -635,14 +634,19 @@ if __name__ == "__main__":
         print(f"{'='*57}")
         print(f"  {'Model':<22} {'Params':>8}  {'Best PPL':>10}  {'vs GPT-S':>9}")
         print(f"  {'-'*52}")
-        gpt_ppl = next((r["best_val_ppl"] for r in results if r["name"] == "gpt-S"), 61.95)
+        gpt_ppl = next((r["best_val_ppl"] for r in results if r["name"] == "gpt-S"), None)
         for r in results:
-            delta = r["best_val_ppl"] - gpt_ppl
-            sign  = "+" if delta >= 0 else ""
+            if gpt_ppl is not None:
+                delta = r["best_val_ppl"] - gpt_ppl
+                sign  = "+" if delta >= 0 else ""
+                delta_str = f"{sign}{delta:>8.4f}"
+            else:
+                delta_str = "      N/A"
             print(f"  {r['name']:<22} "
                   f"{r['n_params']/1e6:>7.2f}M  "
                   f"{r['best_val_ppl']:>10.4f}  "
-                  f"{sign}{delta:>8.4f}")
-        print(f"  (GPT-S exp16 referansı: 61.95 PPL)")
+                  f"{delta_str}")
+        if gpt_ppl is None:
+            print(f"  (GPT-S henüz çalıştırılmadı — karşılaştırma için: --model both)")
         print(f"{'='*57}")
         save_results()
