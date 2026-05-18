@@ -447,7 +447,7 @@ def evaluate(model, stream, steps: int) -> float:
         x, y = stream.get_batch(args.batch_size, args.seq_len)
         with AUTOCAST:
             logits = model(x)
-            total += F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1)).item()
+            total += F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1)).item()
     model.train()
     return math.exp(total / steps)
 
